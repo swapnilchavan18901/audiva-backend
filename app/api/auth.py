@@ -2,9 +2,15 @@ from fastapi import APIRouter
 
 from app.api.dependencies import DB, CurrentUser
 from app.business import auth
+from app.business.demo import start_demo
 from app.types import AuthOut, Credentials, Register, UserOut
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+@router.post("/demo", response_model=AuthOut, status_code=201)
+async def demo(db: DB):
+    return await start_demo(db)
 
 
 @router.post("/register", response_model=AuthOut, status_code=201)

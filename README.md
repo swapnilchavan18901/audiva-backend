@@ -2,6 +2,14 @@
 
 Backend service for the Audiva voice operations platform.
 
+The login and signup page offers **Use demo account**. `POST /api/v1/auth/demo`
+creates an independent demo user and workspace, signs the visitor in with a normal
+access token, and adds a sample agent for each available active feature template.
+No credentials or manual setup are needed. Demo users have ordinary workspace owner
+permissions and cannot access other workspaces or platform operator controls.
+Voice demos use the configured voice provider. Demo workspaces persist in the
+database; there is currently no automatic cleanup or reset of an existing session.
+
 ## Purpose and architectural approach
 
 Audiva connects voice conversations to concrete business workflows: booking a clinic visit, answering a question during a meeting, and carrying useful meeting context forward. This backend owns those workflows, their access rules, and the lifecycle of the external services involved.

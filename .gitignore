@@ -26,6 +26,7 @@ __pycache__/
 !/tests/test_meeting_definitions.py
 !/tests/test_clinic_phone.py
 !/tests/test_turn_credentials.py
+!/tests/test_demo_auth.py
 .coverage
 htmlcov/
 coverage/
