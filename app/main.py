@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.ai.benchmark import configure_logging as configure_benchmark_logging
 from app.ai.sessions import VoiceSessions
 from app.api import (
     auth,
@@ -29,6 +30,7 @@ from app.utils.cors import DashboardCORSMiddleware
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    configure_benchmark_logging()
     settings = get_settings()
     app.state.meeting_voice = MeetingVoiceService(settings)
     app.state.turn = TurnCredentials(settings, SessionFactory)

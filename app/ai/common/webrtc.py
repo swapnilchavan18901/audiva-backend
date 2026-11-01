@@ -16,6 +16,8 @@ from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.workers.runner import WorkerRunner
 
+from app.ai.benchmark import Benchmark
+from app.ai.common.benchmark import BenchmarkObserver
 from app.clients import create_sarvam_services
 from app.constants import constants
 from app.utils.filler import ResponseFiller
@@ -59,11 +61,13 @@ def build_voice(
     output_sample_rate=24000,
 ):
     """Use the same speech processing for browser and phone transports."""
+    benchmark = Benchmark(getattr(bot, "service_type", "conversation"))
     stt, llm, tts = create_sarvam_services(
         settings,
         bot.language,
         system_prompt=system_prompt,
         text_filters=[SpeechNormalizer(bot.language), *text_filters],
+        benchmark=benchmark,
     )
     aggregators = LLMContextAggregatorPair(
         LLMContext(messages=list(messages)),
@@ -85,8 +89,10 @@ def build_voice(
             ]
         ),
         app_resources={},
+        observers=[BenchmarkObserver(benchmark)],
         params=PipelineParams(
-            audio_in_sample_rate=16000, audio_out_sample_rate=output_sample_rate
+            audio_in_sample_rate=16000,
+            audio_out_sample_rate=output_sample_rate,
         ),
         processor_unusable_policy=ProcessorUnusablePolicy.END,
     )

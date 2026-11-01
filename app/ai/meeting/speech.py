@@ -6,6 +6,7 @@ import io
 import json
 import wave
 
+from app.ai.benchmark import Benchmark
 from app.clients import create_sarvam_client
 from app.constants import constants
 from app.constants.constants import SCOPE_POLICY
@@ -27,10 +28,46 @@ def wav_audio(pcm: bytes, sample_rate=16000):
 
 class MeetingSpeech:
     def __init__(self, settings):
+        self.benchmark = Benchmark("meeting")
         self.settings = settings
         self._filler_audio = None
         self._filler_lock = asyncio.Lock()
         self.http = create_sarvam_client(settings)
+
+    async def _post(self, path, *, operation, json, **kwargs):
+        request = self.benchmark.begin("llm", constants.SARVAM_LLM_MODEL, operation)
+        if operation == "memory":
+            request["turn"] = 0
+        usage = None
+        status = "completed"
+        try:
+            # Enforce no thinking for every meeting LLM operation, including memory.
+            response = await self.http.post(
+                path, json={**json, "reasoning_effort": None}, **kwargs
+            )
+            response.raise_for_status()
+            result = response.json()
+            usage = result.get("usage")
+            request["provider_request_id"] = result.get("id")
+            request["model"] = result.get("model") or constants.SARVAM_LLM_MODEL
+            choices = result.get("choices") or []
+            request["finish_reason"] = (
+                choices[0].get("finish_reason") if choices else None
+            )
+            return response
+        except asyncio.CancelledError:
+            status = "interrupted"
+            raise
+        except Exception:
+            status = "failed"
+            raise
+        finally:
+            self.benchmark.response_finished(request)
+            self.benchmark.finish(
+                request,
+                usage=usage,
+                status=status,
+            )
 
     async def transcribe(self, pcm):
         response = await self.http.post(
@@ -51,12 +88,12 @@ class MeetingSpeech:
             for entry in transcript[-60:]
             if entry.get("role", "user") == "user" and not entry.get("addressed")
         ]
-        response = await self.http.post(
+        response = await self._post(
             "/v1/chat/completions",
+            operation="is_in_scope",
             json={
                 "model": constants.SARVAM_LLM_MODEL,
                 "max_tokens": 40,
-                "reasoning_effort": None,
                 "response_format": {"type": "json_object"},
                 "messages": [
                     {"role": "system", "content": SCOPE_POLICY},
@@ -105,12 +142,12 @@ class MeetingSpeech:
             for entry in recent
             if entry.get("role", "user") == "user" and not entry.get("addressed")
         ]
-        response = await self.http.post(
+        response = await self._post(
             "/v1/chat/completions",
+            operation="answer",
             json={
                 "model": constants.SARVAM_LLM_MODEL,
                 "max_tokens": 250,
-                "reasoning_effort": None,
                 "response_format": {"type": "json_object"},
                 "messages": [
                     {
@@ -198,7 +235,11 @@ class MeetingSpeech:
         result = bytearray()
         for audio in response.json()["audios"]:
             with wave.open(io.BytesIO(base64.b64decode(audio)), "rb") as wav:
-                if (wav.getnchannels(), wav.getsampwidth(), wav.getframerate()) != (1, 2, 16000):
+                if (wav.getnchannels(), wav.getsampwidth(), wav.getframerate()) != (
+                    1,
+                    2,
+                    16000,
+                ):
                     raise ValueError("Unexpected TTS audio format")
                 result.extend(wav.readframes(wav.getnframes()))
         return bytes(result)
@@ -206,12 +247,12 @@ class MeetingSpeech:
     async def memory(self, previous, transcript, today):
         from app.constants.constants import MEMORY_POLICY
 
-        response = await self.http.post(
+        response = await self._post(
             "/v1/chat/completions",
+            operation="memory",
             json={
                 "model": constants.SARVAM_LLM_MODEL,
                 "max_tokens": 8000,
-                "reasoning_effort": None,
                 "messages": [
                     {"role": "system", "content": MEMORY_POLICY},
                     {
@@ -236,4 +277,3 @@ class MeetingSpeech:
 
     async def close(self):
         await self.http.aclose()
-

@@ -23,6 +23,7 @@ class Speaker:
     active: bool = False
     parts: list[str] = field(default_factory=list)
     last_packet: float = 0.0
+    benchmark_turn: int | None = None
 
 
 class MeetingVoice:
@@ -115,6 +116,11 @@ class MeetingVoice:
     async def consume(self):
         while True:
             participant, audio, final, generation = await self.queue.get()
+            benchmark = getattr(self.speech, "benchmark", None)
+            speaker = self.speakers[participant]
+            if benchmark and speaker.benchmark_turn is None:
+                speaker.benchmark_turn = benchmark.next_turn()
+            token = benchmark.context_turn.set(speaker.benchmark_turn) if benchmark else None
             try:
                 text = await self.speech.transcribe(audio) if audio else ""
                 if text:
@@ -149,6 +155,10 @@ class MeetingVoice:
             except Exception:
                 self.error = "A speech turn could not be processed. The assistant is still listening."
             finally:
+                if benchmark:
+                    benchmark.context_turn.reset(token)
+                if final:
+                    speaker.benchmark_turn = None
                 self.queue.task_done()
 
     async def reply(self, question, generation):

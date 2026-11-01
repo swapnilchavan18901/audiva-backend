@@ -458,3 +458,35 @@ the old permanent credential in Metered. Temporary credentials remain visible to
 authorized callers and can still consume quota until they expire.
 
 The lifecycle follows [Metered's rotation guidance](https://www.metered.ca/docs/turnserver-guides/rotating-turn-credentials/).
+
+
+## Automatic LLM benchmark logs
+
+Every LLM request in conversation, clinic, outreach and meeting pipelines writes
+an `ai_benchmark` JSON record to backend logs automatically. No separate command
+or script is needed. Records include session and request IDs, pipeline, user turn,
+model, operation, status, provider-reported input/cached/output/total tokens, request duration and estimated
+cost in INR. Meeting scope checks, answers and memory requests are included.
+Streaming calls also log `time_to_first_chunk_ms` and `time_to_first_token_ms`
+(including reasoning or tool-call output), plus the provider completion ID and finish
+reason. Non-streaming calls have no observable first-token latency and log `null`
+for these fields. `duration_ms` measures the full request through stream completion
+or failure, excluding stream cleanup. Raw `provider_usage` is retained in the log;
+no tokenization or character-based token estimates are used. Usage snapshots are
+replaced, never added together. Input, cached input and output cost estimates are
+logged separately alongside their total. Sarvam's documented completion response
+reports usage rather than a billed currency amount, so costs use published rates.
+Prompts, model response text and credentials are not included in benchmark logs.
+
+Turn 0 covers greetings and background work. Other turns follow detected user
+speech. Requests retain their turn ID if a newer turn interrupts them. Missing
+provider usage is logged as `null`, including cost, rather than zero. SDK retries
+are grouped in their logical request, and interrupted streams may not report
+usage; provider billing remains authoritative.
+
+Estimates exclude GST and non-LLM charges. No benchmark environment variables or
+setup are required. Rates live in `app/constants/constants.py`: ₹15 input / ₹5
+cached input / ₹60 output per million tokens for Sarvam 105B, checked on
+2026-11-01 against
+[Sarvam pricing](https://docs.sarvam.ai/api/getting-started/pricing).
+Cached tokens are included in input tokens and priced once at the cached rate.

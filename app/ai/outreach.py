@@ -2,6 +2,8 @@
 
 import json
 
+from app.ai.benchmark import Benchmark
+from app.ai.common.benchmark import BenchmarkObserver
 from app.clients import create_sarvam_services
 from app.utils.text_normalizer import SpeechNormalizer
 
@@ -46,11 +48,13 @@ async def run_voice(websocket, snapshot, contact, start, settings):
 
     rate = int(start["media_format"]["sample_rate"])
     transport = build_transport(websocket, start)
+    benchmark = Benchmark("outreach")
     stt, llm, tts = create_sarvam_services(
         settings,
         snapshot["language"],
         system_prompt=OUTREACH_INSTRUCTIONS,
         text_filters=[SpeechNormalizer(snapshot["language"])],
+        benchmark=benchmark,
     )
     end_call_tool = FunctionSchema(
         name="end_call",
@@ -93,6 +97,7 @@ async def run_voice(websocket, snapshot, contact, start, settings):
             ]
         ),
         app_resources={},
+        observers=[BenchmarkObserver(benchmark)],
         params=PipelineParams(
             audio_in_sample_rate=16000,
             audio_out_sample_rate=rate,

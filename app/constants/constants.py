@@ -7,6 +7,11 @@ from zoneinfo import ZoneInfo
 PRODUCT_NAME = "Audiva"
 ACCESS_TOKEN_MINUTES = 60
 SARVAM_LLM_MODEL = "sarvam-105b"
+# Public Sarvam 105B prices in INR per million tokens, excluding GST.
+# https://docs.sarvam.ai/api/getting-started/pricing (checked 2026-11-01)
+SARVAM_LLM_INPUT_PER_MILLION = 15
+SARVAM_LLM_CACHED_PER_MILLION = 5
+SARVAM_LLM_OUTPUT_PER_MILLION = 60
 SARVAM_STT_MODEL = "saaras:v4"
 SARVAM_TTS_MODEL = "bulbul:v3"
 SARVAM_VOICE = "shubh"
