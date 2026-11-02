@@ -1,6 +1,7 @@
-"""Authenticated clinic phone controls and scoped Exotel media endpoints."""
+"""Authenticated clinic phone controls and scoped Twilio media endpoints."""
 
 import asyncio
+import re
 from contextlib import suppress
 from uuid import UUID, uuid4
 
@@ -10,10 +11,14 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from starlette.websockets import WebSocketDisconnect
 
+from app.ai.common.twilio import stream_xml
 from app.api.dependencies import DB, CurrentUser
+from app.api.phone_callbacks import read_payload
 from app.business import bots
 from app.business.clinic_phone import clinic_bot, network_phone
 from app.business.organizations import require_membership
+from app.clients.twilio import callback_status
+from app.clients.twilio_logging import logger, safe_detail
 from app.clinic_phone_types import (
     PhoneCallOut,
     PhoneDial,
@@ -28,7 +33,7 @@ from app.db.models import ClinicPhoneCall, ClinicPhoneRoute, utcnow
 router = APIRouter(
     prefix="/organizations/{org_id}/bots/{bot_id}/phone", tags=["Clinic phone"]
 )
-provider_router = APIRouter(prefix="/clinic-phone/exotel", tags=["Clinic Exotel"])
+provider_router = APIRouter(prefix="/clinic-phone/twilio", tags=["Clinic Twilio"])
 
 
 @router.get("/capabilities")
@@ -50,7 +55,7 @@ async def capabilities(
         and user.id in service.settings.clinic_operator_user_ids,
         "can_call": manager,
         "inbound_ready": inbound_ready,
-        "outbound_ready": inbound_ready and bool(service.settings.exotel_caller_id),
+        "outbound_ready": inbound_ready and bool(service.settings.twilio_phone_number),
     }
 
 
@@ -66,7 +71,7 @@ async def get_route(
         raise HTTPException(404, "No inbound number configured")
     result = PhoneRouteOut.model_validate(route)
     if route.enabled and request.app.state.clinic_phone.settings.public_backend_url:
-        result.inbound_stream_url = request.app.state.clinic_phone.inbound_url(route)
+        result.inbound_answer_url = request.app.state.clinic_phone.inbound_url(route)
     return result
 
 
@@ -81,9 +86,9 @@ async def set_route(
 ):
     bot = await clinic_bot(db, org_id, bot_id, user.id, write=True)
     service = request.app.state.clinic_phone
-    # The Exotel account is shared: only trusted operators can allocate its numbers.
+    # The Twilio account is shared: only trusted operators can allocate its numbers.
     if user.id not in service.settings.clinic_operator_user_ids:
-        raise HTTPException(403, "A platform operator must allocate the Exotel number")
+        raise HTTPException(403, "A platform operator must allocate the Twilio number")
     if data.enabled:
         service.require_ready()
         await bots.runtime_bot(db, bot)
@@ -109,7 +114,7 @@ async def set_route(
         ) from None
     result = PhoneRouteOut.model_validate(route)
     if route.enabled:
-        result.inbound_stream_url = service.inbound_url(route)
+        result.inbound_answer_url = service.inbound_url(route)
     return result
 
 
@@ -177,7 +182,7 @@ async def reconcile(
             result = await service.provider.details(data.provider_call_sid)
             if (
                 result["Sid"] != data.provider_call_sid
-                or network_phone(result["From"]) != call.phone_number
+                or network_phone(result["To"]) != call.phone_number
             ):
                 raise HTTPException(409, "Provider destination does not match")
         except (httpx.HTTPError, ValueError, KeyError, TypeError):
@@ -188,31 +193,99 @@ async def reconcile(
     return call
 
 
+@provider_router.api_route("/calls/{call_id}/answer", methods=["GET", "POST"])
+async def outbound_answer(call_id: UUID, request: Request, token: str = ""):
+    service = request.app.state.clinic_phone
+    service.verify(call_id, "answer", token)
+    service.require_ready()
+    payload = await read_payload(request)
+    await service.apply_status(call_id, payload.get("CallSid"), "in-progress")
+    url = service.url(f"calls/{call_id}/media", call_id, "media", media=True)
+    logger.info("Twilio answer served service=clinic_phone call_id=%s", call_id)
+    return Response(stream_xml(url), media_type="application/xml")
+
+
+@provider_router.api_route("/inbound/{route_id}/answer", methods=["GET", "POST"])
+async def inbound_answer(route_id: UUID, request: Request, token: str = ""):
+    service = request.app.state.clinic_phone
+    service.require_ready()
+    async with service.sessions() as db:
+        route = await db.get(ClinicPhoneRoute, route_id)
+        if not route or not route.enabled:
+            raise HTTPException(403, "Inbound route unavailable")
+        service.verify(route.token_version, "inbound", token)
+        payload = await read_payload(request)
+        sid = payload.get("CallSid")
+        if not isinstance(sid, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", sid):
+            raise HTTPException(400, "Invalid Twilio call SID")
+        details = await service.provider.details(sid)
+        if (
+            details["Sid"] != sid
+            or details["Status"] != "in-progress"
+            or network_phone(details["To"]) != route.phone_number
+        ):
+            raise HTTPException(403, "Inbound call does not match clinic number")
+        url = service.url(
+            f"inbound/{route_id}/media/{sid}",
+            route.token_version,
+            f"inbound-media:{sid}",
+            media=True,
+        )
+    logger.info("Twilio inbound answer served route_id=%s sid=%s", route_id, sid)
+    return Response(stream_xml(url), media_type="application/xml")
+
+
 @provider_router.post("/calls/{call_id}/status", status_code=204)
 async def status(call_id: UUID, request: Request, token: str = ""):
     service = request.app.state.clinic_phone
-    service.verify(call_id, "status", token)
     try:
-        if "application/json" in request.headers.get("content-type", ""):
-            payload = await request.json()
-        else:
-            payload = dict(
-                await request.form(max_files=0, max_fields=50, max_part_size=16384)
-            )
+        service.verify(call_id, "status", token)
+    except HTTPException as exc:
+        logger.warning(
+            "Twilio callback rejected service=clinic_phone call_id=%s http_status=%s",
+            call_id,
+            exc.status_code,
+        )
+        raise
+    logger.info(
+        "Twilio callback received service=clinic_phone call_id=%s content_type=%s",
+        call_id,
+        request.headers.get("content-type"),
+    )
+    try:
+        payload = await read_payload(request)
         await service.apply_status(
             call_id,
-            payload.get("CallSid") or payload.get("Sid"),
-            payload.get("Status") or payload.get("CallStatus"),
+            payload.get("CallSid"),
+            callback_status(payload),
         )
     except (ValueError, AttributeError, TypeError):
+        logger.warning(
+            "Twilio callback malformed service=clinic_phone call_id=%s", call_id
+        )
         raise HTTPException(400, "Invalid call status callback") from None
+    except HTTPException as exc:
+        logger.warning(
+            "Twilio callback rejected service=clinic_phone call_id=%s http_status=%s reason=%s",
+            call_id,
+            exc.status_code,
+            safe_detail(exc.detail),
+        )
+        raise
+    logger.info("Twilio callback applied service=clinic_phone call_id=%s", call_id)
     return Response(status_code=204)
 
 
-async def media(websocket, *, route_id=None, call_id=None, token=""):
+async def media(websocket, *, route_id=None, call_id=None, token="", call_sid=""):
     service = websocket.app.state.clinic_phone
     task = asyncio.current_task()
     admitted = False
+    phase = "authorization"
+    logger.info(
+        "Twilio media requested service=clinic_phone call_id=%s route_id=%s",
+        call_id,
+        route_id,
+    )
     try:
         service.require_ready()
         if service.closing or len(service.live) >= constants.MAX_VOICE_SESSIONS:
@@ -222,7 +295,7 @@ async def media(websocket, *, route_id=None, call_id=None, token=""):
                 route = await db.get(ClinicPhoneRoute, route_id)
                 if not route or not route.enabled:
                     raise HTTPException(403, "Inbound route unavailable")
-                service.verify(route.token_version, "inbound", token)
+                service.verify(route.token_version, f"inbound-media:{call_sid}", token)
         else:
             service.verify(call_id, "media", token)
         # Count pending starts as well as active audio sessions.
@@ -230,17 +303,29 @@ async def media(websocket, *, route_id=None, call_id=None, token=""):
             raise HTTPException(503, "Clinic phone capacity reached")
         service.live.add(task)
         await websocket.accept()
+        phase = "start_event"
         async with asyncio.timeout(15):
             event = await websocket.receive_json()
             if event.get("event") == "connected":
                 event = await websocket.receive_json()
             start = service.validate_start(event)
+            if route_id and start["call_sid"] != call_sid:
+                raise ValueError("Twilio stream call SID mismatch")
+            phase = "admission"
             call, runtime = await service.admit(
                 start, route_id=route_id, call_id=call_id, token=token
             )
         admitted = True
+        call_id = call.id
+        phase = "voice_pipeline"
+        logger.info(
+            "Twilio media admitted service=clinic_phone call_id=%s sid=%s sample_rate=%s",
+            call_id,
+            start["call_sid"],
+            start["media_format"]["sample_rate"],
+        )
         from app.ai.clinic.pipeline import build_pipeline
-        from app.ai.common.exotel import build_transport
+        from app.ai.common.twilio import build_transport
 
         transport = build_transport(websocket, start)
         runner, worker = build_pipeline(
@@ -260,6 +345,14 @@ async def media(websocket, *, route_id=None, call_id=None, token=""):
             await runner.cancel()
         # Media termination isn't authoritative telephony status: the provider polling
         # loop (and outbound callbacks) owns completion, including across restarts.
+    except WebSocketDisconnect as exc:
+        logger.info(
+            "Twilio media disconnected service=clinic_phone call_id=%s route_id=%s phase=%s code=%s",
+            call_id,
+            route_id,
+            phase,
+            exc.code,
+        )
     except (
         HTTPException,
         ValueError,
@@ -269,21 +362,49 @@ async def media(websocket, *, route_id=None, call_id=None, token=""):
         TimeoutError,
         IntegrityError,
         httpx.HTTPError,
-        WebSocketDisconnect,
-    ):
-        pass
+    ) as exc:
+        logger.warning(
+            "Twilio media failed service=clinic_phone call_id=%s route_id=%s phase=%s error_type=%s reason=%s",
+            call_id,
+            route_id,
+            phase,
+            type(exc).__name__,
+            safe_detail(exc.detail)
+            if isinstance(exc, HTTPException)
+            else type(exc).__name__
+            if isinstance(exc, IntegrityError)
+            else safe_detail(exc),
+        )
+    except Exception as exc:
+        logger.error(
+            "Twilio media failed service=clinic_phone call_id=%s route_id=%s phase=%s error_type=%s reason=%s",
+            call_id,
+            route_id,
+            phase,
+            type(exc).__name__,
+            safe_detail(exc),
+        )
+        raise
     finally:
+        logger.info(
+            "Twilio media closed service=clinic_phone call_id=%s route_id=%s admitted=%s",
+            call_id,
+            route_id,
+            admitted,
+        )
         service.live.discard(task)
         if websocket.client_state.name != "DISCONNECTED":
             with suppress(RuntimeError, WebSocketDisconnect):
                 await websocket.close(code=1000 if admitted else 1008)
 
 
-@provider_router.websocket("/inbound/{route_id}")
-async def inbound_media(websocket: WebSocket, route_id: UUID, token: str = ""):
-    await media(websocket, route_id=route_id, token=token)
+@provider_router.websocket("/inbound/{route_id}/media/{call_sid}/{token}")
+async def inbound_media(
+    websocket: WebSocket, route_id: UUID, token: str = "", call_sid: str = ""
+):
+    await media(websocket, route_id=route_id, token=token, call_sid=call_sid)
 
 
-@provider_router.websocket("/calls/{call_id}/media")
+@provider_router.websocket("/calls/{call_id}/media/{token}")
 async def outbound_media(websocket: WebSocket, call_id: UUID, token: str = ""):
     await media(websocket, call_id=call_id, token=token)

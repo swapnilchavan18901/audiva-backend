@@ -45,7 +45,12 @@ class Provider:
         self.dials.append((number, stream, callback, call_id))
         if self.error:
             raise self.error
-        result = {"Sid": "sid" + call_id.hex, "Status": "in-progress", "From": number}
+        result = {
+            "Sid": "sid" + call_id.hex,
+            "Status": "in-progress",
+            "From": "+918012345678",
+            "To": number,
+        }
         self.states[result["Sid"]] = result
         return result
 
@@ -117,10 +122,9 @@ async def env(tmp_path):
         _env_file=None,
         jwt_secret="test-secret-clinic-phone-at-least-32-characters",
         sarvam_api_key="test",
-        exotel_account_sid="account",
-        exotel_api_key="key",
-        exotel_api_token="token",
-        exotel_caller_id="08012345678",
+        twilio_account_sid="account",
+        twilio_auth_token="token",
+        twilio_phone_number="08012345678",
         public_backend_url="https://clinic.example.com",
         clinic_operator_user_ids=[owner.id],
     )
@@ -170,11 +174,26 @@ def start(sid="incoming", **overrides):
         "from": "+919876543210",
         "to": "+918012345678",
         "media_format": {
-            "encoding": "audio/x-raw",
-            "sample_rate": 16000,
+            "encoding": "audio/x-mulaw",
+            "sample_rate": 8000,
             "bit_rate": 16,
         },
         **overrides,
+    }
+
+
+def wire_start(value):
+    return {
+        "event": "start",
+        "start": {
+            "accountSid": value["account_sid"],
+            "callSid": value["call_sid"],
+            "streamSid": value["stream_sid"],
+            "mediaFormat": {
+                "encoding": value["media_format"]["encoding"],
+                "sampleRate": value["media_format"]["sample_rate"],
+            },
+        },
     }
 
 
@@ -216,7 +235,7 @@ async def test_route_access_rotation_disable_and_uniqueness(env):
     response = await env.client.put(
         env.path + "/route", json={"phone_number": "+918012345678", "enabled": False}
     )
-    assert response.status_code == 200 and response.json()["inbound_stream_url"] is None
+    assert response.status_code == 200 and response.json()["inbound_answer_url"] is None
     async with env.sessions() as db:
         other = Bot(
             name="Other",
@@ -246,13 +265,14 @@ async def test_outbound_idempotency_and_callback_security(env):
     ).status_code == 409
     stream, _callback = env.provider.dials[0][1:3]
     assert stream.startswith(
-        "wss://clinic.example.com/api/v1/clinic-phone/exotel/calls/"
+        "https://clinic.example.com/api/v1/clinic-phone/twilio/calls/"
     )
     call_id = UUID(call["id"])
-    endpoint = f"/api/v1/clinic-phone/exotel/calls/{call_id}/status"
+    endpoint = f"/api/v1/clinic-phone/twilio/calls/{call_id}/status"
     assert (
         await env.client.post(
-            endpoint, json={"Sid": call["provider_call_sid"], "Status": "completed"}
+            endpoint,
+            json={"CallSid": call["provider_call_sid"], "CallStatus": "completed"},
         )
     ).status_code == 403
     token = env.service.token(call_id, "status")
@@ -260,7 +280,7 @@ async def test_outbound_idempotency_and_callback_security(env):
         await env.client.post(
             endpoint,
             params={"token": token},
-            json={"Sid": "wrong", "Status": "completed"},
+            json={"CallSid": "wrong", "CallStatus": "completed"},
         )
     ).status_code == 409
     assert (
@@ -288,7 +308,7 @@ async def test_unknown_dispatch_recovery_does_not_redial(env):
     call_id = response.json()["id"]
     env.provider.states["verified"] = {
         "Sid": "verified",
-        "From": data["phone_number"],
+        "To": data["phone_number"],
         "Status": "completed",
     }
     result = await env.client.post(
@@ -301,7 +321,7 @@ async def test_unknown_dispatch_recovery_does_not_redial(env):
 @pytest.mark.asyncio
 async def test_inbound_verifies_provider_and_rejects_replay(env):
     config = await route(env)
-    token = env.service.token(config.token_version, "inbound")
+    token = env.service.inbound_media_token(config, "incoming")
     env.provider.states["incoming"] = {
         "Sid": "incoming",
         "From": "09876543210",
@@ -346,6 +366,8 @@ async def test_outbound_stream_is_single_use(env):
     [
         {"account_sid": "other"},
         {"call_sid": ""},
+        {"call_sid": None},
+        {"stream_sid": None},
         {"media_format": {"encoding": "mulaw", "sample_rate": 8000}},
         {"media_format": {"encoding": "audio/x-raw", "sample_rate": 44100}},
     ],
@@ -353,7 +375,7 @@ async def test_outbound_stream_is_single_use(env):
 @pytest.mark.asyncio
 async def test_invalid_media_format_rejected(env, change):
     with pytest.raises(ValueError):
-        env.service.validate_start({"event": "start", "start": start(**change)})
+        env.service.validate_start(wire_start(start(**change)))
 
 
 @pytest.mark.asyncio
@@ -370,7 +392,7 @@ async def test_inbound_admitted_clinic_can_book_only_after_confirmation(env):
     call, runtime = await env.service.admit(
         start(),
         route_id=config.id,
-        token=env.service.token(config.token_version, "inbound"),
+        token=env.service.inbound_media_token(config, "incoming"),
     )
 
     async def queue(_):
@@ -432,13 +454,13 @@ async def test_webrtc_endpoint_remains_available(env):
 
 
 @pytest.mark.parametrize("direction", ["inbound", "outbound"])
-@pytest.mark.parametrize("rate", [8000, 16000, 24000])
+@pytest.mark.parametrize("rate", [8000])
 @pytest.mark.asyncio
 async def test_real_clinic_phone_pipeline_construction(
     env, direction, rate, monkeypatch
 ):
     from app.ai.clinic.pipeline import build_pipeline
-    from app.ai.common.exotel import build_transport
+    from app.ai.common.twilio import build_transport
 
     async with env.sessions() as db:
         bot = await db.get(Bot, env.bot.id)
@@ -515,9 +537,10 @@ async def test_media_endpoint_dispatches_to_clinic_pipeline(
         }
         kwargs = {
             "route_id": config.id,
-            "token": env.service.token(config.token_version, "inbound"),
+            "token": env.service.inbound_media_token(config, "incoming"),
+            "call_sid": "incoming",
         }
-        event = {"event": "start", "start": start()}
+        event = wire_start(start())
     else:
         response = await env.client.post(
             env.path + "/calls",
@@ -525,7 +548,7 @@ async def test_media_endpoint_dispatches_to_clinic_pipeline(
         )
         call_id = UUID(response.json()["id"])
         kwargs = {"call_id": call_id, "token": env.service.token(call_id, "media")}
-        event = {"event": "start", "start": start(response.json()["provider_call_sid"])}
+        event = wire_start(start(response.json()["provider_call_sid"]))
 
     class Socket:
         app = env.app
@@ -557,7 +580,7 @@ async def test_media_endpoint_dispatches_to_clinic_pipeline(
         return Runner(), object()
 
     monkeypatch.setattr("app.ai.clinic.pipeline.build_pipeline", build)
-    monkeypatch.setattr("app.ai.common.exotel.build_transport", lambda *args: object())
+    monkeypatch.setattr("app.ai.common.twilio.build_transport", lambda *args: object())
     socket = Socket()
     await api.media(socket, **{**kwargs, "token": "invalid"})
     assert not socket.accepted and socket.close_code == 1008 and seen == []
@@ -579,7 +602,7 @@ def test_telephony_tokens_redacted_from_uvicorn_logs():
         "",
         0,
         "WebSocket %s",
-        ("/api/v1/clinic-phone/exotel/inbound/route?token=secret&sample-rate=16000",),
+        ("/api/v1/clinic-phone/twilio/inbound/route?token=secret&sample-rate=16000",),
         None,
     )
     AudioGrantLogFilter().filter(record)
@@ -607,7 +630,7 @@ async def test_phone_capabilities_follow_membership_and_operator_role(env):
         and not result["can_call"]
         and not result["can_manage_route"]
     )
-    env.settings.exotel_caller_id = ""
+    env.settings.twilio_phone_number = ""
     result = (await env.client.get(env.path + "/capabilities")).json()
     assert result["inbound_ready"] and not result["outbound_ready"]
     env.settings.sarvam_api_key = type(env.settings.sarvam_api_key)("")
@@ -666,3 +689,128 @@ async def test_context_text_alone_updates_clinic_runtime_and_clears_old_facts(en
         assert runtime.clinic_facts["clinic_name"] is None
         assert runtime.clinic_facts["doctors"] == []
         assert runtime.clinic_facts["booking_ready"] is False
+
+
+@pytest.mark.asyncio
+async def test_twilio_answer_xml_and_real_call_sid_binding(env):
+    from xml.etree.ElementTree import fromstring
+
+    async def accepted(number, answer, callback, call_id):
+        env.provider.dials.append((number, answer, callback, call_id))
+        return {"Sid": "actual-call", "Status": "queued"}
+
+    env.provider.dial = accepted
+    data = {"phone_number": "+919876543210", "request_id": str(uuid4())}
+    result = await env.client.post(env.path + "/calls", json=data)
+    assert result.status_code == 202
+    assert (
+        result.json()["status"] == "queued"
+        and result.json()["provider_call_sid"] == "actual-call"
+    )
+    await env.client.post(env.path + "/calls", json=data)
+    assert len(env.provider.dials) == 1
+    answer = env.provider.dials[0][1]
+    response = await env.client.post(answer, data={"CallSid": "actual-call"})
+    assert response.status_code == 200
+    xml = fromstring(response.text)
+    assert (
+        xml.find("Connect/Stream")
+        .get("url")
+        .startswith("wss://clinic.example.com/api/v1/clinic-phone/twilio/calls/")
+    )
+    assert "?" not in xml.find("Connect/Stream").get("url")
+    listing = await env.client.get(env.path + "/calls")
+    assert listing.json()[0]["provider_call_sid"] == "actual-call"
+    assert listing.json()[0]["status"] == "in-progress"
+    assert (
+        await env.client.post(answer.split("?")[0], data={"CallSid": "fake"})
+    ).status_code == 403
+    assert (await env.client.post(answer, data={"CallSid": "other"})).status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_twilio_inbound_answer_checks_number_and_binds_media_token(env):
+    from urllib.parse import urlsplit
+    from xml.etree.ElementTree import fromstring
+
+    config = await route(env)
+    answer = env.service.inbound_url(config)
+    env.provider.states["incoming"] = {
+        "Sid": "incoming",
+        "Status": "in-progress",
+        "From": "+919876543210",
+        "To": "+918012345679",
+    }
+    assert (
+        await env.client.post(answer, data={"CallSid": "incoming"})
+    ).status_code == 403
+    env.provider.states["incoming"]["To"] = config.phone_number
+    response = await env.client.post(answer, data={"CallSid": "incoming"})
+    assert response.status_code == 200
+    stream = fromstring(response.text).find("Connect/Stream").get("url")
+    assert not urlsplit(stream).query
+    assert urlsplit(stream).path.endswith(
+        "/media/incoming/" + env.service.inbound_media_token(config, "incoming")
+    )
+    with pytest.raises(HTTPException):
+        env.service.verify(
+            config.token_version, "inbound-media:other", stream.rsplit("/", 1)[-1]
+        )
+    # Saving a route rotates both its answer grant and its media grants.
+    await route(env)
+    assert (
+        await env.client.post(answer, data={"CallSid": "incoming"})
+    ).status_code == 403
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/v1/clinic-phone/twilio/calls/call/media/",
+        "/api/v1/clinic-phone/twilio/inbound/route/media/CAcall/",
+        "/api/v1/outreach/twilio/call/media/",
+    ],
+)
+def test_twilio_media_path_grants_redacted_from_uvicorn_logs(path):
+    import logging
+
+    from app.business.meeting_voice import AudioGrantLogFilter
+
+    grant = "a" * 64
+    record = logging.LogRecord(
+        "uvicorn.error",
+        logging.INFO,
+        "",
+        0,
+        "WebSocket %s [accepted]",
+        (path + grant,),
+        None,
+    )
+    assert AudioGrantLogFilter().filter(record)
+    assert grant not in record.getMessage()
+    assert "[redacted]" in record.getMessage()
+
+
+@pytest.mark.asyncio
+async def test_restricted_twilio_trial_shows_actionable_failure_without_retry(env):
+    request = httpx.Request("POST", "https://api.twilio.com/Calls.json")
+    env.provider.error = httpx.HTTPStatusError(
+        "bad request",
+        request=request,
+        response=httpx.Response(
+            400,
+            request=request,
+            json={
+                "code": 0,
+                "message": "Invalid or disallowed parameters provided - trial accounts have limited parameter access, upgrade your account to unlock full functionality",
+            },
+        ),
+    )
+    data = {"phone_number": "+919876543210", "request_id": str(uuid4())}
+    result = await env.client.post(env.path + "/calls", json=data)
+    assert result.status_code == 202
+    assert result.json()["status"] == "failed"
+    assert "trial restrictions" in result.json()["error"]
+    assert "browser voice" in result.json()["error"]
+    await env.client.post(env.path + "/calls", json=data)
+    assert len(env.provider.dials) == 1

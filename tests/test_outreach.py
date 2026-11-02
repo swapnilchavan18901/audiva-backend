@@ -2,6 +2,8 @@
 
 import asyncio
 import importlib.util
+import json
+import logging
 import os
 from datetime import timedelta
 from types import SimpleNamespace
@@ -12,7 +14,7 @@ import httpx
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI, HTTPException
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 from sqlalchemy import event, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -20,7 +22,8 @@ from app.api import outreach as api
 from app.api.dependencies import current_user
 from app.business import outreach
 from app.business.outreach_worker import OutreachService
-from app.clients.exotel import ExotelClient
+from app.clients.twilio import TwilioClient
+from app.clients.twilio_logging import safe_detail
 from app.db.models import (
     Base,
     Membership,
@@ -53,7 +56,12 @@ class FakeProvider:
         if self.error:
             raise self.error
         sid = f"sid{call_id.hex}"
-        self.states[sid] = {"Sid": sid, "Status": "in-progress", "From": number}
+        self.states[sid] = {
+            "Sid": sid,
+            "Status": "in-progress",
+            "From": "+918012345678",
+            "To": number,
+        }
         return self.states[sid]
 
     async def details(self, sid):
@@ -104,10 +112,9 @@ async def env(tmp_path):
     settings = Settings(
         _env_file=None,
         jwt_secret="test-secret-for-outreach-only-123456789",
-        exotel_account_sid="account",
-        exotel_api_key="key",
-        exotel_api_token="token",
-        exotel_caller_id="08012345678",
+        twilio_account_sid="account",
+        twilio_auth_token="token",
+        twilio_phone_number="08012345678",
         public_backend_url="https://outreach.example.com",
         sarvam_api_key="test",
     )
@@ -326,11 +333,11 @@ async def test_multiple_agents_campaigns_run_together(env):
 @pytest.mark.asyncio
 async def test_run_is_once_and_requires_provider_configuration(env):
     campaign = await draft(env)
-    env.service.settings.exotel_account_sid = ""
+    env.service.settings.twilio_account_sid = ""
     with pytest.raises(HTTPException) as unavailable:
         await run(env, campaign)
     assert unavailable.value.status_code == 503
-    env.service.settings.exotel_account_sid = "account"
+    env.service.settings.twilio_account_sid = "account"
     await run(env, campaign)
     with pytest.raises(HTTPException) as duplicate:
         await run(env, campaign)
@@ -360,9 +367,9 @@ async def test_status_callbacks_auth_ordering_and_sid_binding(env):
     await run(env, campaign)
     await env.service.tick()
     call = (await calls(env, campaign))[0]
-    path = f"/api/v1/outreach/exotel/{call.id}/status"
+    path = f"/api/v1/outreach/twilio/{call.id}/status"
     token = env.service.token(call.id, "status")
-    body = {"CallSid": call.provider_call_sid, "Status": "completed"}
+    body = {"CallSid": call.provider_call_sid, "CallStatus": "completed"}
     assert (await env.client.post(path, data=body)).status_code == 403
     wrong = env.service.token(call.id, "media")
     assert (
@@ -378,7 +385,7 @@ async def test_status_callbacks_auth_ordering_and_sid_binding(env):
     ).status_code == 204
     assert (
         await env.client.post(
-            path, params={"token": token}, json={**body, "Status": "ringing"}
+            path, params={"token": token}, json={**body, "CallStatus": "ringing"}
         )
     ).status_code == 204
     assert (await calls(env, campaign))[0].status == "completed"
@@ -499,33 +506,47 @@ async def test_csv_upload_template_and_validation(env):
 
 
 @pytest.mark.asyncio
-async def test_exotel_wire_contract(env):
+async def test_twilio_wire_contract(env):
     captured = []
 
     async def handler(request):
         captured.append(request)
-        return httpx.Response(200, json={"Call": {"Sid": "sid", "Status": "queued"}})
+        return httpx.Response(201, json={"sid": "CAcall", "status": "queued"})
 
-    provider = ExotelClient(env.settings)
+    provider = TwilioClient(env.settings)
     await provider.http.aclose()
     provider.http = httpx.AsyncClient(
-        base_url="https://api.in.exotel.com/v1/Accounts/account/",
+        base_url="https://api.twilio.com/2010-04-01/Accounts/account/",
+        auth=("account", "token"),
         transport=httpx.MockTransport(handler),
     )
-    await provider.dial(
+    result = await provider.dial(
         "+919876543210",
-        "wss://example.com/media",
+        "https://example.com/answer",
         "https://example.com/status",
         uuid4(),
     )
     body = parse_qs(captured[0].content.decode())
-    assert body["From"] == ["+919876543210"]
-    assert body["StreamType"] == ["bidirectional"]
-    assert body["Record"] == ["false"]
-    assert body["TimeLimit"] == ["1800"]
-    assert body["StatusCallbackEvents[]"] == ["ringing", "answered", "terminal"]
-    assert body["StatusCallbackContentType"] == ["application/json"]
-    assert captured[0].url.path.endswith("/Calls/connect")
+    assert body["From"] == [env.settings.twilio_phone_number]
+    assert body["To"] == ["+919876543210"]
+    assert body["Url"] == ["https://example.com/answer"]
+    assert body["Method"] == ["POST"]
+    assert body["StatusCallback"] == ["https://example.com/status"]
+    assert body["StatusCallbackEvent"] == [
+        "initiated",
+        "ringing",
+        "answered",
+        "completed",
+    ]
+    assert body["TimeLimit"] == ["1800"] and body["Record"] == ["false"]
+    assert captured[0].url.path == "/2010-04-01/Accounts/account/Calls.json"
+    assert captured[0].headers["authorization"].startswith("Basic ")
+    assert (
+        captured[0]
+        .headers["content-type"]
+        .startswith("application/x-www-form-urlencoded")
+    )
+    assert result == {"Sid": "CAcall", "Status": "queued"}
     await provider.close()
 
 
@@ -568,7 +589,7 @@ async def test_multipart_callback_and_unicode_token(env):
     await run(env, campaign)
     await env.service.tick()
     call = (await calls(env, campaign))[0]
-    path = f"/api/v1/outreach/exotel/{call.id}/status"
+    path = f"/api/v1/outreach/twilio/{call.id}/status"
     response = await env.client.post(path, params={"token": "é"}, json={})
     assert response.status_code == 403
     response = await env.client.post(
@@ -576,7 +597,7 @@ async def test_multipart_callback_and_unicode_token(env):
         params={"token": env.service.token(call.id, "status")},
         files={
             "CallSid": (None, call.provider_call_sid),
-            "Status": (None, "completed"),
+            "CallStatus": (None, "completed"),
         },
     )
     assert response.status_code == 204
@@ -618,34 +639,30 @@ async def test_media_auth_binding_snapshot_and_one_stream_per_call(env, monkeypa
     start = {
         "event": "start",
         "start": {
-            "account_sid": "account",
-            "stream_sid": "stream",
-            "call_sid": call.provider_call_sid,
-            "media_format": {
-                "encoding": "audio/x-raw",
-                "sample_rate": "16000",
-                "bit_rate": "16",
-            },
+            "accountSid": "account",
+            "streamSid": "stream",
+            "callSid": call.provider_call_sid,
+            "mediaFormat": {"encoding": "audio/x-mulaw", "sampleRate": 8000},
         },
     }
     token = env.service.token(call.id, "media")
     bad = FakeWebsocket(env.app, [start])
-    await api.exotel_media(bad, call.id, "wrong")
+    await api.twilio_media(bad, call.id, "wrong")
     assert bad.close_code == 1008
     wrong_sid = FakeWebsocket(
-        env.app, [{**start, "start": {**start["start"], "call_sid": "wrong"}}]
+        env.app, [{**start, "start": {**start["start"], "callSid": "wrong"}}]
     )
-    await api.exotel_media(wrong_sid, call.id, token)
+    await api.twilio_media(wrong_sid, call.id, token)
     assert wrong_sid.close_code == 1008
     assert not invoked
     ws = FakeWebsocket(env.app, [{"event": "connected"}, start])
-    await api.exotel_media(ws, call.id, token)
+    await api.twilio_media(ws, call.id, token)
     assert invoked[0]["sales_context"] == env.agent.sales_context
     assert ws.close_code == 1000
     # Socket closure alone must not free a slot before provider termination.
     assert (await calls(env, campaign))[0].status == "in-progress"
     duplicate = FakeWebsocket(env.app, [start])
-    await api.exotel_media(duplicate, call.id, token)
+    await api.twilio_media(duplicate, call.id, token)
     assert duplicate.close_code == 1008
     assert len(invoked) == 1
 
@@ -683,7 +700,7 @@ async def test_real_voice_pipeline_construction_without_external_requests(
         {
             "stream_sid": "stream",
             "call_sid": "call",
-            "media_format": {"sample_rate": 16000},
+            "media_format": {"sample_rate": 8000},
         },
         env.settings,
     )
@@ -712,3 +729,218 @@ async def test_concurrent_workers_reserve_at_most_one_batch(env):
         len([call for call in await calls(env, campaign) if call.status == "dialing"])
         == 5
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["rejected", "timeout", "invalid_json"])
+async def test_provider_failure_is_logged_without_retry_or_secrets(caplog, failure):
+    settings = SimpleNamespace(
+        twilio_account_sid="account",
+        twilio_auth_token=SecretStr("private-api-token"),
+        twilio_phone_number="+911234567890",
+    )
+    number = "+919876543210"
+    stream = "https://example.com/answer?token=private-answer-grant"
+    callback = "https://example.com/status?token=private-callback-grant"
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if failure == "timeout":
+            raise httpx.ReadTimeout("Timed out", request=request)
+        if failure == "invalid_json":
+            return httpx.Response(200, text="invalid json")
+        return httpx.Response(
+            401,
+            json={
+                "message": f"Authentication failed private-api-token {number} {stream} {callback}",
+                "code": 20003,
+                "status": 401,
+            },
+        )
+
+    provider = TwilioClient(settings)
+    await provider.http.aclose()
+    provider.http = httpx.AsyncClient(
+        base_url="https://api.twilio.com/2010-04-01/Accounts/account/",
+        transport=httpx.MockTransport(handler),
+    )
+    call_id = uuid4()
+    try:
+        with (
+            caplog.at_level(logging.INFO, logger="app.twilio"),
+            pytest.raises((httpx.HTTPError, ValueError)),
+        ):
+            await provider.dial(number, stream, callback, call_id)
+    finally:
+        await provider.close()
+    assert len(requests) == 1
+    assert "Twilio request failed" in caplog.text
+    assert str(call_id) in caplog.text
+    assert "elapsed_ms=" in caplog.text
+    for secret in (
+        "private-api-token",
+        number,
+        "private-answer-grant",
+        "private-callback-grant",
+    ):
+        assert secret not in caplog.text
+    if failure == "rejected":
+        assert "http_status=401" in caplog.text
+        assert "Authentication failed" in caplog.text
+        assert "20003" in caplog.text
+    elif failure == "timeout":
+        assert "error_type=ReadTimeout" in caplog.text
+    else:
+        assert "error_type=JSONDecodeError" in caplog.text
+
+
+def test_safe_detail_bounds_and_cleans_provider_text():
+    result = safe_detail(
+        "token=private-grant\nFrom: +91 (98765) 43210\rhttps://example.com/private "
+        + "x" * 3000
+    )
+    assert "private-grant" not in result
+    assert "98765" not in result
+    assert "example.com" not in result
+    assert "\n" not in result and "\r" not in result
+    assert len(result) <= 2000
+
+
+@pytest.mark.asyncio
+async def test_twilio_queued_call_sid_and_answer_xml(env):
+    async def accepted(number, answer, callback, call_id):
+        env.provider.dials.append((number, answer, callback, call_id))
+        env.provider.states["real-call"] = {"Sid": "real-call", "Status": "queued"}
+        return env.provider.states["real-call"]
+
+    env.provider.dial = accepted
+    campaign = await draft(env, count=2, mode="sequential")
+    await run(env, campaign)
+    await env.service.tick()
+    call = (await calls(env, campaign))[0]
+    assert call.status == "queued" and call.provider_call_sid == "real-call"
+    await env.service.tick()
+    assert len(env.provider.dials) == 1
+    answer, _ = env.service.urls(call.id)
+    response = await env.client.post(answer, data={"CallSid": "real-call"})
+    assert response.status_code == 200
+    from xml.etree.ElementTree import fromstring
+
+    xml = fromstring(response.text)
+    stream = xml.find("Connect/Stream")
+    assert stream.get("url") == env.service.media_url(call.id)
+    assert "?" not in stream.get("url")
+    assert xml.find("Hangup") is not None
+    call = (await calls(env, campaign))[0]
+    assert call.provider_call_sid == "real-call" and call.status == "in-progress"
+    wrong = await env.client.post(answer.split("?")[0], data={"CallSid": "fake"})
+    assert wrong.status_code == 403
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider_status,expected",
+    [("in-progress", "in-progress"), ("busy", "busy"), ("canceled", "cancelled")],
+)
+async def test_twilio_details_call_resource(env, provider_status, expected):
+    captured = []
+
+    def handler(request):
+        captured.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "sid": "CAcall",
+                "status": provider_status,
+                "from": "+918012345678",
+                "to": "+919876543210",
+            },
+        )
+
+    provider = TwilioClient(env.settings)
+    await provider.http.aclose()
+    provider.http = httpx.AsyncClient(
+        base_url="https://api.twilio.com/2010-04-01/Accounts/account/",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        result = await provider.details("CAcall")
+    finally:
+        await provider.close()
+    assert result["Sid"] == "CAcall" and result["To"] == "+919876543210"
+    assert result["Status"] == expected
+    assert len(captured) == 1
+    assert captured[0].url.path.endswith("/Calls/CAcall.json")
+    assert not captured[0].url.query
+
+
+@pytest.mark.asyncio
+async def test_twilio_serializer_audio_and_interruption():
+    import base64
+
+    from pipecat.frames.frames import (
+        EndFrame,
+        InputAudioRawFrame,
+        InterruptionFrame,
+        OutputAudioRawFrame,
+    )
+
+    from app.ai.common.twilio import build_transport
+
+    transport = build_transport(
+        SimpleNamespace(), {"call_sid": "call", "stream_sid": "stream"}
+    )
+    serializer = transport._params.serializer
+    await serializer.setup(SimpleNamespace(audio_in_sample_rate=8000))
+    incoming = await serializer.deserialize(
+        json.dumps(
+            {
+                "event": "media",
+                "media": {
+                    "payload": base64.b64encode(b"\xff" * 160).decode(),
+                },
+            }
+        )
+    )
+    assert isinstance(incoming, InputAudioRawFrame)
+    assert incoming.sample_rate == 8000 and len(incoming.audio) == 320
+    outgoing = json.loads(
+        await serializer.serialize(
+            OutputAudioRawFrame(
+                audio=b"\x00\x00" * 160,
+                sample_rate=8000,
+                num_channels=1,
+            )
+        )
+    )
+    assert outgoing["event"] == "media"
+    assert outgoing["streamSid"] == "stream"
+    assert len(base64.b64decode(outgoing["media"]["payload"])) == 160
+    cleared = json.loads(await serializer.serialize(InterruptionFrame()))
+    assert cleared == {"event": "clear", "streamSid": "stream"}
+    assert isinstance(await serializer.deserialize('{"event":"stop"}'), EndFrame)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"message": "Trial accounts have limited parameter access"},
+        {"message": "The number is unverified on a trial account", "code": 21219},
+        ["unexpected payload"],
+    ],
+)
+def test_twilio_trial_rejection_only_maps_restricted_parameter_error(body):
+    from app.clients.twilio import rejection_message
+
+    request = httpx.Request("POST", "https://api.twilio.com/Calls.json")
+    exc = httpx.HTTPStatusError(
+        "rejected",
+        request=request,
+        response=httpx.Response(400, json=body, request=request),
+    )
+    result = rejection_message(exc)
+    if isinstance(body, dict) and "limited parameter access" in body["message"]:
+        assert "Media Streams" in result
+    else:
+        assert result == "Twilio rejected the call request"

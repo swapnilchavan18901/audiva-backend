@@ -14,6 +14,8 @@ from sqlalchemy.exc import IntegrityError
 
 from app.business import bots
 from app.business.outreach import TERMINAL
+from app.clients.twilio import rejection_message
+from app.clients.twilio_logging import logger as twilio_logger
 from app.constants import constants
 from app.db.models import Bot, ClinicPhoneCall, ClinicPhoneRoute, utcnow
 from app.db.session import SessionFactory
@@ -23,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 def network_phone(value):
-    """Exotel India may return national numbers; API inputs still require E.164."""
+    """Normalize provider numbers; API inputs still require E.164."""
     value = re.sub(r"[\s().-]", "", str(value))
     if not value.startswith("+"):
         if len(value) == 11 and value.startswith("0"):
@@ -45,7 +47,7 @@ async def clinic_bot(db, org_id, bot_id, user_id, *, write=False):
 
 class ClinicPhoneService:
     def __init__(self, settings, provider, *, sessions=SessionFactory):
-        # Share Exotel's account-wide request limiter with Outreach.
+        # Share Twilio's account-wide request limiter with Outreach.
         self.settings, self.provider, self.sessions = settings, provider, sessions
         self.task = None
         self.live = set()
@@ -55,15 +57,12 @@ class ClinicPhoneService:
         if not all(
             (
                 self.settings.public_backend_url,
-                self.settings.exotel_account_sid,
-                self.settings.exotel_api_key.get_secret_value(),
-                self.settings.exotel_api_token.get_secret_value(),
+                self.settings.twilio_account_sid,
+                self.settings.twilio_auth_token.get_secret_value(),
                 self.settings.sarvam_api_key.get_secret_value(),
             )
         ):
-            raise HTTPException(
-                503, "Configure Exotel, Sarvam and PUBLIC_BACKEND_URL"
-            )
+            raise HTTPException(503, "Configure Twilio, Sarvam and PUBLIC_BACKEND_URL")
 
     def token(self, identity, purpose):
         return hmac.new(
@@ -82,13 +81,15 @@ class ClinicPhoneService:
         base = self.settings.public_backend_url.rstrip("/")
         if media:
             base = base.replace("https://", "wss://", 1)
-        return f"{base}/api/v1/clinic-phone/exotel/{path}?token={self.token(identity, purpose)}"
+        endpoint = f"{base}/api/v1/clinic-phone/twilio/{path}"
+        grant = self.token(identity, purpose)
+        return f"{endpoint}/{grant}" if media else f"{endpoint}?token={grant}"
 
     def inbound_url(self, route):
-        return (
-            self.url(f"inbound/{route.id}", route.token_version, "inbound", media=True)
-            + "&sample-rate=16000"
-        )
+        return self.url(f"inbound/{route.id}/answer", route.token_version, "inbound")
+
+    def inbound_media_token(self, route, sid):
+        return self.token(route.token_version, f"inbound-media:{sid}")
 
     async def apply_status(self, call_id, sid, status):
         if not isinstance(sid, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", sid):
@@ -107,6 +108,7 @@ class ClinicPhoneService:
                 raise HTTPException(409, "Call SID mismatch")
             if call.status in TERMINAL:
                 return
+            previous_status = call.status
             call.provider_call_sid = sid
             rank = {"queued": 0, "ringing": 1, "in-progress": 2}
             if status in TERMINAL or rank.get(status, -1) >= rank.get(call.status, -1):
@@ -114,11 +116,22 @@ class ClinicPhoneService:
             if status in TERMINAL:
                 call.finished_at = utcnow()
             await db.commit()
+            if call.status != previous_status:
+                twilio_logger.info(
+                    "Twilio status changed service=%s call_id=%s sid=%s previous=%s status=%s",
+                    "clinic_phone",
+                    call_id,
+                    sid,
+                    previous_status,
+                    call.status,
+                )
 
     async def dial(self, db, bot, data):
         self.require_ready()
-        if not self.settings.exotel_caller_id:
-            raise HTTPException(503, "Configure EXOTEL_CALLER_ID before outbound calls")
+        if not self.settings.twilio_phone_number:
+            raise HTTPException(
+                503, "Configure TWILIO_PHONE_NUMBER before outbound calls"
+            )
         previous = await db.scalar(
             select(ClinicPhoneCall).where(
                 ClinicPhoneCall.bot_id == bot.id,
@@ -157,22 +170,26 @@ class ClinicPhoneService:
                 409, "Call request conflicts with an existing attempt"
             ) from None
         call_id = call.id
-        stream = (
-            self.url(f"calls/{call_id}/media", call_id, "media", media=True)
-            + "&sample-rate=16000"
-        )
+        answer = self.url(f"calls/{call_id}/answer", call_id, "answer")
         callback = self.url(f"calls/{call_id}/status", call_id, "status")
         try:
             result = await self.provider.dial(
-                data.phone_number, stream, callback, call_id
+                data.phone_number, answer, callback, call_id
             )
-            await self.apply_status(
-                call_id, result["Sid"], result.get("Status", "queued")
-            )
+            await self.apply_status(call_id, result["Sid"], result["Status"])
         except Exception as exc:  # noqa: BLE001 - preserve uncertain external side effects
             rejected = (
                 isinstance(exc, httpx.HTTPStatusError)
                 and 400 <= exc.response.status_code < 500
+            )
+            twilio_logger.error(
+                "Twilio dispatch failed service=%s call_id=%s error_type=%s outcome=%s",
+                "clinic_phone",
+                call_id,
+                type(exc).__name__,
+                "rejected"
+                if rejected
+                else "unknown; awaiting callback or reconciliation",
             )
             # Never overwrite a successful concurrent callback or redial an uncertain attempt.
             await db.execute(
@@ -184,9 +201,9 @@ class ClinicPhoneService:
                 )
                 .values(
                     status="failed" if rejected else "unknown",
-                    error="Exotel rejected the call"
+                    error=rejection_message(exc)
                     if rejected
-                    else "Dispatch unknown; verify with Exotel before reconciliation",
+                    else "Dispatch unknown; verify with Twilio before reconciliation",
                     finished_at=utcnow() if rejected else None,
                 )
             )
@@ -195,21 +212,9 @@ class ClinicPhoneService:
         return call
 
     def validate_start(self, event):
-        start = event["start"]
-        audio = start["media_format"]
-        if (
-            event.get("event") != "start"
-            or start.get("account_sid") != self.settings.exotel_account_sid
-            or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", str(start.get("call_sid", "")))
-            or not re.fullmatch(
-                r"[A-Za-z0-9_-]{1,128}", str(start.get("stream_sid", ""))
-            )
-            or audio.get("encoding") != "audio/x-raw"
-            or int(audio.get("bit_rate", 16)) != 16
-            or int(audio["sample_rate"]) not in {8000, 16000, 24000}
-        ):
-            raise ValueError("Invalid Exotel start event")
-        return start
+        from app.ai.common.twilio import validate_start
+
+        return validate_start(event, self.settings.twilio_account_sid)
 
     async def admit(self, start, *, route_id=None, call_id=None, token=""):
         async with self.sessions() as db:
@@ -217,15 +222,15 @@ class ClinicPhoneService:
                 route = await db.get(ClinicPhoneRoute, route_id)
                 if not route or not route.enabled:
                     raise HTTPException(403, "Inbound route unavailable")
-                self.verify(route.token_version, "inbound", token)
+                self.verify(
+                    route.token_version, f"inbound-media:{start['call_sid']}", token
+                )
                 # Check the actual provider call, not just untrusted WebSocket metadata.
                 details = await self.provider.details(start["call_sid"])
                 if (
                     details["Sid"] != start["call_sid"]
                     or details["Status"] != "in-progress"
                     or network_phone(details["To"]) != route.phone_number
-                    or network_phone(start["to"]) != route.phone_number
-                    or network_phone(details["From"]) != network_phone(start["from"])
                 ):
                     raise HTTPException(403, "Inbound number or caller mismatch")
                 call = ClinicPhoneCall(
@@ -296,20 +301,20 @@ class ClinicPhoneService:
                 if call.provider_call_sid:
                     result = await self.provider.details(call.provider_call_sid)
                     await self.apply_status(call.id, result["Sid"], result["Status"])
-                elif call.status == "dialing":
+                elif call.status in {"dialing", "queued"}:
                     async with self.sessions() as db:
                         await db.execute(
                             update(ClinicPhoneCall)
                             .where(
                                 ClinicPhoneCall.id == call.id,
-                                ClinicPhoneCall.status == "dialing",
+                                ClinicPhoneCall.status.in_({"dialing", "queued"}),
                                 ClinicPhoneCall.provider_call_sid.is_(None),
                                 ClinicPhoneCall.created_at
                                 < utcnow() - timedelta(seconds=60),
                             )
                             .values(
                                 status="unknown",
-                                error="Interrupted dispatch; reconcile with Exotel",
+                                error="Interrupted dispatch; reconcile with Twilio",
                             )
                         )
                         await db.commit()
@@ -320,7 +325,10 @@ class ClinicPhoneService:
         # Deployment settings are fixed until restart; avoid idle polling when disabled.
         try:
             self.require_ready()
-        except HTTPException:
+        except HTTPException as exc:
+            twilio_logger.warning(
+                "Twilio worker disabled service=clinic_phone reason=%s", exc.detail
+            )
             return
 
         async def loop():

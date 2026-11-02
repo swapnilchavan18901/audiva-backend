@@ -28,9 +28,19 @@ class AudioGrantLogFilter(logging.Filter):
 
     def filter(self, record):
         def clean(value):
-            if isinstance(value, str) and any(path in value for path in (
-                "/meeting-audio/", "/clinic-phone/exotel/", "/outreach/exotel/",
-            )):
+            if isinstance(value, str) and any(
+                path in value
+                for path in (
+                    "/meeting-audio/",
+                    "/clinic-phone/twilio/",
+                    "/outreach/twilio/",
+                )
+            ):
+                value = re.sub(
+                    r"(/media/(?:[^/\s?\"']+/)?)[a-f0-9]{64}(?=[?\s\"']|$)",
+                    r"\1[redacted]",
+                    value,
+                )
                 return re.sub(r"([?&]token=)[^\s\"']+", r"\1[redacted]", value)
             return value
 

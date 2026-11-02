@@ -11,7 +11,8 @@ from fastapi import HTTPException
 from sqlalchemy import select
 
 from app.business.outreach import ACTIVE, TERMINAL
-from app.clients.exotel import ExotelClient
+from app.clients.twilio import TwilioClient, rejection_message
+from app.clients.twilio_logging import logger as twilio_logger
 from app.db.models import OutreachCall, OutreachCampaign, utcnow
 from app.db.session import SessionFactory
 
@@ -22,23 +23,22 @@ class OutreachService:
     def __init__(self, settings, *, sessions=SessionFactory, provider=None):
         self.settings = settings
         self.sessions = sessions
-        self.provider = provider or ExotelClient(settings)
+        self.provider = provider or TwilioClient(settings)
         self.tasks = []
 
     def require_ready(self):
         if not all(
             [
-                self.settings.exotel_account_sid,
-                self.settings.exotel_api_key.get_secret_value(),
-                self.settings.exotel_api_token.get_secret_value(),
-                self.settings.exotel_caller_id,
+                self.settings.twilio_account_sid,
+                self.settings.twilio_auth_token.get_secret_value(),
+                self.settings.twilio_phone_number,
                 self.settings.public_backend_url,
                 self.settings.sarvam_api_key.get_secret_value(),
             ]
         ):
             raise HTTPException(
                 503,
-                "Configure Exotel, PUBLIC_BACKEND_URL (HTTPS) and Sarvam before running",
+                "Configure Twilio, PUBLIC_BACKEND_URL (HTTPS) and Sarvam before running",
             )
 
     def token(self, call_id, purpose):
@@ -56,19 +56,26 @@ class OutreachService:
 
     def urls(self, call_id):
         base = self.settings.public_backend_url.rstrip("/")
-        path = f"/api/v1/outreach/exotel/{call_id}"
+        path = f"/api/v1/outreach/twilio/{call_id}"
         return (
-            base.replace("https://", "wss://", 1)
-            + path
-            + f"/media?token={self.token(call_id, 'media')}&sample-rate=16000",
+            base + path + f"/answer?token={self.token(call_id, 'answer')}",
             base + path + f"/status?token={self.token(call_id, 'status')}",
+        )
+
+    def media_url(self, call_id):
+        base = self.settings.public_backend_url.rstrip("/").replace(
+            "https://", "wss://", 1
+        )
+        return (
+            base
+            + f"/api/v1/outreach/twilio/{call_id}/media/{self.token(call_id, 'media')}"
         )
 
     async def apply_status(self, call_id, sid, status):
         if not isinstance(sid, str) or not sid or len(sid) > 128:
-            raise HTTPException(400, "Invalid Exotel call SID")
+            raise HTTPException(400, "Invalid Twilio call SID")
         if status not in TERMINAL | {"queued", "ringing", "in-progress"}:
-            raise HTTPException(400, "Unsupported Exotel call status")
+            raise HTTPException(400, "Unsupported Twilio call status")
         async with self.sessions() as db:
             call = await db.scalar(
                 select(OutreachCall).where(OutreachCall.id == call_id).with_for_update()
@@ -79,6 +86,7 @@ class OutreachService:
                 raise HTTPException(409, "Call SID does not match")
             if call.status in TERMINAL:
                 return  # Duplicate / out-of-order callbacks never reopen a finished call.
+            previous_status = call.status
             call.provider_call_sid = sid
             rank = {"queued": 0, "ringing": 1, "in-progress": 2}
             if status in TERMINAL or rank.get(status, -1) >= rank.get(call.status, -1):
@@ -88,6 +96,15 @@ class OutreachService:
             if status in TERMINAL:
                 call.finished_at = utcnow()
             await db.commit()
+            if call.status != previous_status:
+                twilio_logger.info(
+                    "Twilio status changed service=%s call_id=%s sid=%s previous=%s status=%s",
+                    "outreach_worker",
+                    call_id,
+                    sid,
+                    previous_status,
+                    call.status,
+                )
 
     async def claim_batch(self, campaign_id):
         async with self.sessions() as db:
@@ -139,15 +156,22 @@ class OutreachService:
         try:
             stream, callback = self.urls(call_id)
             result = await self.provider.dial(number, stream, callback, call_id)
-            await self.apply_status(
-                call_id, result["Sid"], result.get("Status", "queued")
-            )
+            await self.apply_status(call_id, result["Sid"], result["Status"])
         except Exception as exc:  # noqa: BLE001 - preserve ambiguous outcomes on any dispatch failure
             # A timeout/5xx/malformed response can still have placed a real phone call.
             # Keep its slot reserved, accept a late callback and NEVER auto-redial it.
             rejected = (
                 isinstance(exc, httpx.HTTPStatusError)
                 and 400 <= exc.response.status_code < 500
+            )
+            twilio_logger.error(
+                "Twilio dispatch failed service=%s call_id=%s error_type=%s outcome=%s",
+                "outreach_worker",
+                call_id,
+                type(exc).__name__,
+                "rejected"
+                if rejected
+                else "unknown; awaiting callback or reconciliation",
             )
             async with self.sessions() as db:
                 call = await db.scalar(
@@ -158,7 +182,7 @@ class OutreachService:
                 if call.status == "dialing" and not call.provider_call_sid:
                     call.status = "failed" if rejected else "unknown"
                     call.error = (
-                        "Exotel rejected the call request"
+                        rejection_message(exc)
                         if rejected
                         else "Dispatch outcome unknown; awaiting callback or provider reconciliation"
                     )
@@ -188,21 +212,21 @@ class OutreachService:
                     logger.warning(
                         "Outreach call status refresh failed for %s", call.id
                     )
-            elif call.status == "dialing":
+            elif call.status in {"dialing", "queued"}:
                 # Recover a process that died between reservation and storing the response.
                 async with self.sessions() as db:
                     stuck = await db.scalar(
                         select(OutreachCall)
                         .where(
                             OutreachCall.id == call.id,
-                            OutreachCall.status == "dialing",
+                            OutreachCall.status.in_({"dialing", "queued"}),
                             OutreachCall.started_at < utcnow() - timedelta(seconds=60),
                         )
                         .with_for_update()
                     )
                     if stuck:
                         stuck.status = "unknown"
-                        stuck.error = "Interrupted dispatch; reconcile with Exotel before continuing"
+                        stuck.error = "Interrupted dispatch; reconcile with Twilio before continuing"
                         await db.commit()
 
     async def dispatch_pending(self):
@@ -229,7 +253,10 @@ class OutreachService:
         # Deployment settings are fixed until restart; avoid idle polling when disabled.
         try:
             self.require_ready()
-        except HTTPException:
+        except HTTPException as exc:
+            twilio_logger.warning(
+                "Twilio worker disabled service=outreach_worker reason=%s", exc.detail
+            )
             return
 
         async def loop(action):

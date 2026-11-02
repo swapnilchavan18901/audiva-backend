@@ -22,6 +22,7 @@ from app.business.meeting_scheduler import start as start_meeting_scheduler
 from app.business.meeting_voice import MeetingVoiceService
 from app.business.outreach_worker import OutreachService
 from app.business.turn_credentials import TurnCredentials
+from app.clients.twilio_logging import configure_logging as configure_twilio_logging
 from app.constants.constants import PRODUCT_NAME
 from app.db.session import SessionFactory, engine
 from app.env import get_settings
@@ -31,6 +32,7 @@ from app.utils.cors import DashboardCORSMiddleware
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_benchmark_logging()
+    configure_twilio_logging()
     settings = get_settings()
     app.state.meeting_voice = MeetingVoiceService(settings)
     app.state.turn = TurnCredentials(settings, SessionFactory)

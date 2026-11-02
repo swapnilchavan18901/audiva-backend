@@ -1,9 +1,7 @@
-"""Organization-scoped Outreach API plus narrowly authenticated Exotel callbacks."""
+"""Organization-scoped Outreach API plus narrowly authenticated Twilio callbacks."""
 
 import asyncio
-import json
 from typing import Annotated, Literal
-from urllib.parse import parse_qs
 from uuid import UUID
 
 import httpx
@@ -20,11 +18,14 @@ from fastapi import (
 )
 from pydantic import BaseModel, Field, ValidationError, model_validator
 from sqlalchemy import select
-from starlette.formparsers import MultiPartException, MultiPartParser
 from starlette.websockets import WebSocketDisconnect
 
+from app.ai.common.twilio import stream_xml, validate_start
 from app.api.dependencies import DB, CurrentUser
+from app.api.phone_callbacks import read_payload
 from app.business import outreach
+from app.clients.twilio import callback_status
+from app.clients.twilio_logging import logger, safe_detail
 from app.db.models import OutreachAgent, OutreachCall, OutreachCampaign, utcnow
 from app.outreach_types import (
     MAX_CSV_BYTES,
@@ -38,7 +39,7 @@ from app.outreach_types import (
 )
 
 router = APIRouter(prefix="/organizations/{org_id}/outreach", tags=["Audiva Outreach"])
-provider_router = APIRouter(prefix="/outreach/exotel", tags=["Exotel callbacks"])
+provider_router = APIRouter(prefix="/outreach/twilio", tags=["Twilio callbacks"])
 
 
 @router.get("/agents", response_model=list[OutreachAgentOut])
@@ -199,7 +200,7 @@ class ReconcileCall(BaseModel):
     def exactly_one(self):
         if bool(self.provider_call_sid) == bool(self.confirmed_not_placed):
             raise ValueError(
-                "Provide a call SID or explicitly confirm Exotel never placed the call"
+                "Provide a call SID or explicitly confirm Twilio never placed the call"
             )
         return self
 
@@ -229,7 +230,7 @@ async def reconcile_call(
     if data.confirmed_not_placed:
         call.status = "failed"
         call.error = (
-            "Organization operator confirmed that Exotel did not place the call"
+            "Organization operator confirmed that Twilio did not place the call"
         )
         call.finished_at = utcnow()
         await db.commit()
@@ -238,7 +239,7 @@ async def reconcile_call(
             result = await request.app.state.outreach.provider.details(
                 data.provider_call_sid
             )
-            if Contact(phone_number=result["From"]).phone_number != call.phone_number:
+            if Contact(phone_number=result["To"]).phone_number != call.phone_number:
                 raise HTTPException(
                     409, "Provider call destination does not match this contact"
                 )
@@ -254,73 +255,83 @@ async def reconcile_call(
     return call
 
 
-@provider_router.post("/{call_id}/status", status_code=204)
-async def exotel_status(call_id: UUID, request: Request, token: str = ""):
+@provider_router.api_route("/{call_id}/answer", methods=["GET", "POST"])
+async def twilio_answer(call_id: UUID, request: Request, token: str = ""):
     service = request.app.state.outreach
-    service.verify(call_id, "status", token)
-    content = bytearray()
-    async for chunk in request.stream():
-        content.extend(chunk)
-        if len(content) > 16384:
-            raise HTTPException(413, "Callback too large")
+    service.verify(call_id, "answer", token)
+    service.require_ready()
+    payload = await read_payload(request)
+    await service.apply_status(call_id, payload.get("CallSid"), "in-progress")
+    logger.info("Twilio answer served service=outreach call_id=%s", call_id)
+    return Response(
+        stream_xml(service.media_url(call_id)), media_type="application/xml"
+    )
+
+
+@provider_router.post("/{call_id}/status", status_code=204)
+async def twilio_status(call_id: UUID, request: Request, token: str = ""):
+    service = request.app.state.outreach
     try:
-        content_type = request.headers.get("content-type", "")
-        if content_type.startswith("application/json"):
-            payload = json.loads(content)
-        elif content_type.startswith("multipart/form-data"):
-
-            async def stream():
-                yield bytes(content)
-
-            payload = dict(
-                await MultiPartParser(
-                    request.headers,
-                    stream(),
-                    max_files=0,
-                    max_fields=20,
-                    max_part_size=16384,
-                ).parse()
-            )
-        else:
-            payload = {k: v[-1] for k, v in parse_qs(content.decode()).items()}
+        service.verify(call_id, "status", token)
+    except HTTPException as exc:
+        logger.warning(
+            "Twilio callback rejected service=outreach call_id=%s http_status=%s",
+            call_id,
+            exc.status_code,
+        )
+        raise
+    logger.info(
+        "Twilio callback received service=outreach call_id=%s content_type=%s",
+        call_id,
+        request.headers.get("content-type"),
+    )
+    try:
+        payload = await read_payload(request)
         await service.apply_status(
             call_id,
-            payload.get("CallSid") or payload.get("Sid"),
-            payload.get("Status") or payload.get("CallStatus"),
+            payload.get("CallSid"),
+            callback_status(payload),
         )
-    except (ValueError, AttributeError, TypeError, MultiPartException):
+    except (ValueError, AttributeError, TypeError):
+        logger.warning("Twilio callback malformed service=outreach call_id=%s", call_id)
         raise HTTPException(400, "Invalid status callback") from None
+    except HTTPException as exc:
+        logger.warning(
+            "Twilio callback rejected service=outreach call_id=%s http_status=%s reason=%s",
+            call_id,
+            exc.status_code,
+            safe_detail(exc.detail),
+        )
+        raise
+    logger.info("Twilio callback applied service=outreach call_id=%s", call_id)
     return Response(status_code=204)
 
 
-@provider_router.websocket("/{call_id}/media")
-async def exotel_media(websocket: WebSocket, call_id: UUID, token: str = ""):
+@provider_router.websocket("/{call_id}/media/{token}")
+async def twilio_media(websocket: WebSocket, call_id: UUID, token: str = ""):
     service = websocket.app.state.outreach
     try:
         service.verify(call_id, "media", token)
         service.require_ready()
-    except HTTPException:
+    except HTTPException as exc:
+        logger.warning(
+            "Twilio media rejected service=outreach call_id=%s reason=%s",
+            call_id,
+            safe_detail(exc.detail),
+        )
         await websocket.close(code=1008)
         return
     await websocket.accept()
     claimed = False
+    phase = "start_event"
+    logger.info("Twilio media connected service=outreach call_id=%s", call_id)
     try:
         async with asyncio.timeout(15):
             event = await websocket.receive_json()
             if event.get("event") == "connected":
                 event = await websocket.receive_json()
-            start = event["start"]
-            audio_format = start["media_format"]
-            if (
-                event.get("event") != "start"
-                or not start.get("stream_sid")
-                or not start.get("call_sid")
-                or start.get("account_sid") != service.settings.exotel_account_sid
-                or audio_format.get("encoding") != "audio/x-raw"
-                or int(audio_format.get("bit_rate", 16)) != 16
-                or int(audio_format["sample_rate"]) not in {8000, 16000, 24000}
-            ):
-                raise ValueError("Invalid Exotel start event")
+            start = validate_start(event, service.settings.twilio_account_sid)
+        phase = "admission"
         async with service.sessions() as db:
             call = await db.scalar(
                 select(OutreachCall).where(OutreachCall.id == call_id).with_for_update()
@@ -345,12 +356,46 @@ async def exotel_media(websocket: WebSocket, call_id: UUID, token: str = ""):
             claimed = True
         from app.ai.outreach import run_voice
 
+        phase = "voice_pipeline"
+        logger.info(
+            "Twilio media admitted service=outreach call_id=%s sid=%s sample_rate=%s",
+            call_id,
+            start["call_sid"],
+            start["media_format"]["sample_rate"],
+        )
         async with asyncio.timeout(1800):
             await run_voice(websocket, snapshot, contact, start, service.settings)
-    except (ValueError, KeyError, TypeError, TimeoutError, WebSocketDisconnect):
-        pass
+    except WebSocketDisconnect as exc:
+        logger.info(
+            "Twilio media disconnected service=outreach call_id=%s phase=%s code=%s",
+            call_id,
+            phase,
+            exc.code,
+        )
+    except (ValueError, KeyError, TypeError, TimeoutError) as exc:
+        logger.warning(
+            "Twilio media failed service=outreach call_id=%s phase=%s error_type=%s reason=%s",
+            call_id,
+            phase,
+            type(exc).__name__,
+            safe_detail(exc),
+        )
+    except Exception as exc:
+        logger.error(
+            "Twilio media failed service=outreach call_id=%s phase=%s error_type=%s reason=%s",
+            call_id,
+            phase,
+            type(exc).__name__,
+            safe_detail(exc),
+        )
+        raise
     finally:
-        # A media disconnect does not prove the phone call ended. Only Exotel status
+        logger.info(
+            "Twilio media closed service=outreach call_id=%s claimed=%s",
+            call_id,
+            claimed,
+        )
+        # A media disconnect does not prove the phone call ended. Only Twilio status
         # can release the batch slot. Prevent reconnects from creating a second voice agent.
         if websocket.client_state.name != "DISCONNECTED":
             try:

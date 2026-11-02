@@ -32,11 +32,9 @@ class Settings(BaseSettings):
         default="", pattern=r"^(?:[a-z0-9][a-z0-9-]*\.metered\.live)?$"
     )
     metered_secret_key: SecretStr = SecretStr("")
-    exotel_account_sid: str = Field(default="", pattern=r"^[A-Za-z0-9_-]*$")
-    exotel_api_key: SecretStr = SecretStr("")
-    exotel_api_token: SecretStr = SecretStr("")
-    exotel_api_host: str = "api.in.exotel.com"
-    exotel_caller_id: str = ""
+    twilio_account_sid: str = Field(default="", pattern=r"^[A-Za-z0-9_-]*$")
+    twilio_auth_token: SecretStr = SecretStr("")
+    twilio_phone_number: str = ""
     clinic_operator_user_ids: list[UUID] = []
 
     @field_validator("database_url")
@@ -50,13 +48,6 @@ class Settings(BaseSettings):
             raise ValueError(
                 "DATABASE_URL must use postgresql+asyncpg or sqlite+aiosqlite"
             ) from None
-        return value
-
-    @field_validator("exotel_api_host")
-    @classmethod
-    def valid_exotel_host(cls, value):
-        if value not in {"api.in.exotel.com", "api.exotel.com"}:
-            raise ValueError("Unsupported Exotel region host")
         return value
 
     @field_validator("public_backend_url")

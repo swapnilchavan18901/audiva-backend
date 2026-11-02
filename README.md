@@ -403,16 +403,16 @@ Change model names, speech defaults, filler timing, session limits, and calendar
 ## Audiva Outreach: outbound AI sales campaigns
 
 Organizations can create reusable sales agents with their own context, prepare campaigns
-from phone numbers or CSV, and explicitly start calls through Exotel. Execution supports
+from phone numbers or CSV, and explicitly start calls through Twilio. Execution supports
 one number at a time or batches of five concurrent calls, with independent campaigns
-running simultaneously. See [Outreach setup, API workflow and recovery](docs/outreach.md).
+running simultaneously. See [Outreach setup, API workflow and recovery](docs/twilio.md).
 
 ## Clinic inbound and outbound phone calls
 
-Clinic agents support the existing browser WebRTC interface and Exotel phone
-calls using the same conversation flow and appointment tools. Inbound ExoPhone
+Clinic agents support the existing browser WebRTC interface and Twilio phone
+calls using the same conversation flow and appointment tools. Inbound Twilio number
 routing, authorized outbound calls, deduplication, status callbacks and recovery
-are described in [Clinic phone setup and APIs](docs/clinic-phone.md).
+are described in [Clinic phone setup and APIs](docs/twilio.md).
 
 
 ## Temporary TURN credentials

@@ -1,4 +1,4 @@
-"""Exotel PCM voice transport using the existing Sarvam STT → LLM → TTS stack."""
+"""Twilio mu-law voice transport using the existing Sarvam STT → LLM → TTS stack."""
 
 import json
 
@@ -44,7 +44,7 @@ async def run_voice(websocket, snapshot, contact, start, settings):
     )
     from pipecat.workers.runner import WorkerRunner
 
-    from app.ai.common.exotel import build_transport
+    from app.ai.common.twilio import build_transport
 
     rate = int(start["media_format"]["sample_rate"])
     transport = build_transport(websocket, start)

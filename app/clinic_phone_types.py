@@ -26,7 +26,7 @@ class PhoneRouteOut(ORMModel):
     bot_id: UUID
     phone_number: str
     enabled: bool
-    inbound_stream_url: str | None = None
+    inbound_answer_url: str | None = None
 
 
 class PhoneDial(BaseModel):
