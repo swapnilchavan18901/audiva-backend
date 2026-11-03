@@ -2,7 +2,7 @@
 
 import re
 from datetime import date, datetime, time
-from typing import Literal
+from typing import Annotated, Literal
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -13,9 +13,14 @@ from pydantic import (
     EmailStr,
     Field,
     StrictBool,
+    StringConstraints,
     field_validator,
     model_validator,
 )
+
+DisplayName = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)
+]
 
 
 class ORMModel(BaseModel):
@@ -44,7 +49,7 @@ class Credentials(BaseModel):
 
 
 class Register(Credentials):
-    name: str = Field(min_length=1, max_length=100)
+    name: DisplayName
 
 
 class UserOut(ORMModel):
@@ -60,7 +65,8 @@ class AuthOut(BaseModel):
 
 
 class OrgCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=100)
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    name: DisplayName
 
 
 class OrgOut(ORMModel):
@@ -95,7 +101,7 @@ class InviteAccept(BaseModel):
 
 class BotConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    name: str = Field(min_length=1, max_length=100)
+    name: DisplayName
     company_context: str = Field(default="", max_length=20000)
     language: Literal[
         "hi-IN",
@@ -141,7 +147,7 @@ class TemplateOut(ORMModel):
 
 
 class ApiKeyCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=100)
+    name: DisplayName
     expires_in_days: int = Field(default=90, ge=1, le=365)
 
 
@@ -310,7 +316,9 @@ class ContextDoctor(BaseModel):
     def local_slots(cls, value):
         if value is not None:
             if any(t.tzinfo or t.second or t.microsecond for t in value):
-                raise ValueError("Published slots must use minute-precision clinic-local datetimes")
+                raise ValueError(
+                    "Published slots must use minute-precision clinic-local datetimes"
+                )
             return sorted(set(value))
         return value
 
@@ -345,15 +353,21 @@ class ClinicDetails(BaseModel):
     @field_validator("working_days")
     @classmethod
     def valid_days(cls, value):
-        if value is not None and (not value or any(day < 0 or day > 6 for day in value)):
-            raise ValueError("Working days must contain weekdays from 0 (Monday) to 6 (Sunday)")
+        if value is not None and (
+            not value or any(day < 0 or day > 6 for day in value)
+        ):
+            raise ValueError(
+                "Working days must contain weekdays from 0 (Monday) to 6 (Sunday)"
+            )
         return sorted(set(value)) if value is not None else None
 
     @field_validator("open_time", "close_time", "lunch_start", "lunch_end")
     @classmethod
     def minute_precision(cls, value):
         if value and (value.second or value.microsecond or value.tzinfo is not None):
-            raise ValueError("Use local HH:MM times without seconds or timezone offsets")
+            raise ValueError(
+                "Use local HH:MM times without seconds or timezone offsets"
+            )
         return value
 
     @model_validator(mode="after")

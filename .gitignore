@@ -28,6 +28,7 @@ __pycache__/
 !/tests/test_turn_credentials.py
 !/tests/test_demo_auth.py
 !/tests/test_call_status.py
+!/tests/test_launch_protection.py
 .coverage
 htmlcov/
 coverage/

@@ -2,11 +2,12 @@
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlsplit
 from uuid import UUID
 
 from cryptography.fernet import Fernet
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
@@ -39,6 +40,53 @@ class Settings(BaseSettings):
     twilio_auth_token: SecretStr = SecretStr("")
     twilio_phone_number: str = ""
     clinic_operator_user_ids: list[UUID] = []
+    app_environment: Literal["development", "test", "production"] = "development"
+    registration_enabled: bool = True
+    auth_max_concurrency: int = Field(default=4, ge=1, le=16)
+    demo_enabled: bool | None = None
+    api_requests_per_minute: int = Field(default=2400, ge=1, le=100000)
+    user_requests_per_minute: int = Field(default=1200, ge=1, le=100000)
+    login_requests_per_minute: int = Field(default=10, ge=1, le=1000)
+    signup_requests_per_hour: int = Field(default=5, ge=1, le=1000)
+    demo_requests_per_hour: int = Field(default=3, ge=1, le=1000)
+    write_requests_per_minute: int = Field(default=120, ge=1, le=10000)
+    voice_starts_per_minute: int = Field(default=10, ge=1, le=1000)
+    phone_calls_per_minute: int = Field(default=10, ge=1, le=1000)
+    campaign_starts_per_minute: int = Field(default=3, ge=1, le=1000)
+    voice_tokens_per_minute: int = Field(default=60, ge=1, le=10000)
+    rate_limit_max_buckets: int = Field(default=20000, ge=100, le=100000)
+    max_request_body_bytes: int = Field(default=3_000_000, ge=1024, le=10_000_000)
+    request_body_timeout_seconds: int = Field(default=30, ge=1, le=120)
+
+    @property
+    def demo_allowed(self):
+        return (
+            self.demo_enabled
+            if self.demo_enabled is not None
+            else self.app_environment != "production"
+        )
+
+    @model_validator(mode="after")
+    def production_configuration(self):
+        if self.app_environment != "production":
+            return self
+        secret = self.jwt_secret.get_secret_value().lower()
+        if any(
+            marker in secret
+            for marker in ("replace-with", "change-me", "test-secret", "demo-test")
+        ):
+            raise ValueError("Use a randomly generated JWT_SECRET in production")
+        if not self.database_url.startswith("postgresql+asyncpg://"):
+            raise ValueError("Production requires PostgreSQL")
+        if not self.public_backend_url:
+            raise ValueError("Set PUBLIC_BACKEND_URL to the production HTTPS origin")
+        if not self.cors_origins or any(
+            not origin.startswith("https://") for origin in self.cors_origins
+        ):
+            raise ValueError(
+                "Production CORS_ORIGINS must contain explicit HTTPS origins"
+            )
+        return self
 
     @field_validator("database_url")
     @classmethod

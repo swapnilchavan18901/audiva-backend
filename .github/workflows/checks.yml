@@ -1,0 +1,43 @@
+name: Backend release checks
+on: [push, pull_request]
+permissions:
+  contents: read
+concurrency:
+  group: backend-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: audiva_ci
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci-only-password
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d audiva_ci"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      APP_ENVIRONMENT: test
+      JWT_SECRET: ci-only-secret-never-use-in-production-1234567890
+      DATABASE_URL: sqlite+aiosqlite:///ci-imports.db
+      OUTREACH_TEST_POSTGRES_URL: postgresql+asyncpg://postgres:ci-only-password@localhost:5432/audiva_ci
+      MEETING_TEST_POSTGRES_URL: postgresql+asyncpg://postgres:ci-only-password@localhost:5432/audiva_ci
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Install audio runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsndfile1 libgomp1
+      - run: uv sync --locked --dev
+      - run: uv run ruff check app tests
+      - run: uv run pytest -q

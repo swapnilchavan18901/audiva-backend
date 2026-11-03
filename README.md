@@ -2,13 +2,20 @@
 
 Backend service for the Audiva voice operations platform.
 
-The login and signup page offers **Use demo account**. `POST /api/v1/auth/demo`
+See the [launch checklist](docs/launch-readiness.md) for production settings,
+rate limits, deployment checks, and remaining operational requirements. Run
+`uv run python -m app.core.launch_check` for a read-only production configuration
+and migration check before releasing.
+
+When enabled, the login page offers **Explore Audiva**. `POST /api/v1/auth/demo`
 creates an independent demo user and workspace, signs the visitor in with a normal
 access token, and adds a sample agent for each available active feature template.
 No credentials or manual setup are needed. Demo users have ordinary workspace owner
 permissions and cannot access other workspaces or platform operator controls.
 Voice demos use the configured voice provider. Demo workspaces persist in the
 database; there is currently no automatic cleanup or reset of an existing session.
+Demo access defaults off in production; `DEMO_ENABLED` and
+`REGISTRATION_ENABLED` control the actions advertised by `/api/v1/auth/options`.
 
 ## Purpose and architectural approach
 
