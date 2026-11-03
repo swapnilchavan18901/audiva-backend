@@ -13,7 +13,11 @@ from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.business import bots
-from app.business.outreach import TERMINAL
+from app.business.call_status import (
+    PROVIDER_CALL_STATUSES,
+    TERMINAL_CALL_STATUSES,
+    should_advance_call_status,
+)
 from app.clients.twilio import rejection_message
 from app.clients.twilio_logging import logger as twilio_logger
 from app.constants import constants
@@ -94,7 +98,7 @@ class ClinicPhoneService:
     async def apply_status(self, call_id, sid, status):
         if not isinstance(sid, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", sid):
             raise HTTPException(400, "Invalid call SID")
-        if status not in TERMINAL | {"queued", "ringing", "in-progress"}:
+        if status not in PROVIDER_CALL_STATUSES:
             raise HTTPException(400, "Invalid call status")
         async with self.sessions() as db:
             call = await db.scalar(
@@ -106,14 +110,13 @@ class ClinicPhoneService:
                 raise HTTPException(404, "Call not found")
             if call.provider_call_sid and call.provider_call_sid != sid:
                 raise HTTPException(409, "Call SID mismatch")
-            if call.status in TERMINAL:
+            if call.status in TERMINAL_CALL_STATUSES:
                 return
             previous_status = call.status
             call.provider_call_sid = sid
-            rank = {"queued": 0, "ringing": 1, "in-progress": 2}
-            if status in TERMINAL or rank.get(status, -1) >= rank.get(call.status, -1):
+            if should_advance_call_status(call.status, status):
                 call.status, call.error = status, None
-            if status in TERMINAL:
+            if status in TERMINAL_CALL_STATUSES:
                 call.finished_at = utcnow()
             await db.commit()
             if call.status != previous_status:
@@ -249,7 +252,7 @@ class ClinicPhoneService:
                 if (
                     not call
                     or call.direction != "outbound"
-                    or call.status in TERMINAL
+                    or call.status in TERMINAL_CALL_STATUSES
                     or (
                         call.provider_call_sid
                         and call.provider_call_sid != start["call_sid"]
@@ -261,7 +264,7 @@ class ClinicPhoneService:
                     .where(
                         ClinicPhoneCall.id == call_id,
                         ClinicPhoneCall.stream_claimed.is_(False),
-                        ClinicPhoneCall.status.not_in(TERMINAL),
+                        ClinicPhoneCall.status.not_in(TERMINAL_CALL_STATUSES),
                         or_(
                             ClinicPhoneCall.provider_call_sid.is_(None),
                             ClinicPhoneCall.provider_call_sid == start["call_sid"],
@@ -292,7 +295,7 @@ class ClinicPhoneService:
             calls = list(
                 await db.scalars(
                     select(ClinicPhoneCall).where(
-                        ClinicPhoneCall.status.not_in(TERMINAL)
+                        ClinicPhoneCall.status.not_in(TERMINAL_CALL_STATUSES)
                     )
                 )
             )

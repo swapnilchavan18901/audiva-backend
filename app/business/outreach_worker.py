@@ -10,7 +10,12 @@ import httpx
 from fastapi import HTTPException
 from sqlalchemy import select
 
-from app.business.outreach import ACTIVE, TERMINAL
+from app.business.call_status import (
+    ACTIVE_CALL_STATUSES,
+    PROVIDER_CALL_STATUSES,
+    TERMINAL_CALL_STATUSES,
+    should_advance_call_status,
+)
 from app.clients.twilio import TwilioClient, rejection_message
 from app.clients.twilio_logging import logger as twilio_logger
 from app.db.models import OutreachCall, OutreachCampaign, utcnow
@@ -74,7 +79,7 @@ class OutreachService:
     async def apply_status(self, call_id, sid, status):
         if not isinstance(sid, str) or not sid or len(sid) > 128:
             raise HTTPException(400, "Invalid Twilio call SID")
-        if status not in TERMINAL | {"queued", "ringing", "in-progress"}:
+        if status not in PROVIDER_CALL_STATUSES:
             raise HTTPException(400, "Unsupported Twilio call status")
         async with self.sessions() as db:
             call = await db.scalar(
@@ -84,16 +89,15 @@ class OutreachService:
                 raise HTTPException(404, "Dispatched call not found")
             if call.provider_call_sid and call.provider_call_sid != sid:
                 raise HTTPException(409, "Call SID does not match")
-            if call.status in TERMINAL:
+            if call.status in TERMINAL_CALL_STATUSES:
                 return  # Duplicate / out-of-order callbacks never reopen a finished call.
             previous_status = call.status
             call.provider_call_sid = sid
-            rank = {"queued": 0, "ringing": 1, "in-progress": 2}
-            if status in TERMINAL or rank.get(status, -1) >= rank.get(call.status, -1):
+            if should_advance_call_status(call.status, status):
                 call.status = status
                 # Provider confirmation resolves an ambiguous dispatch.
                 call.error = None
-            if status in TERMINAL:
+            if status in TERMINAL_CALL_STATUSES:
                 call.finished_at = utcnow()
             await db.commit()
             if call.status != previous_status:
@@ -119,7 +123,7 @@ class OutreachService:
                 select(OutreachCall.id)
                 .where(
                     OutreachCall.campaign_id == campaign.id,
-                    OutreachCall.status.in_(ACTIVE),
+                    OutreachCall.status.in_(ACTIVE_CALL_STATUSES),
                 )
                 .limit(1)
             )
@@ -194,7 +198,9 @@ class OutreachService:
         async with self.sessions() as db:
             active = list(
                 await db.scalars(
-                    select(OutreachCall).where(OutreachCall.status.in_(ACTIVE))
+                    select(OutreachCall).where(
+                        OutreachCall.status.in_(ACTIVE_CALL_STATUSES)
+                    )
                 )
             )
         for call in active:

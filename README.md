@@ -498,3 +498,13 @@ cached input / ₹60 output per million tokens for Sarvam 105B, checked on
 2026-11-01 against
 [Sarvam pricing](https://docs.sarvam.ai/api/getting-started/pricing).
 Cached tokens are included in input tokens and priced once at the cached rate.
+
+## Quality checks
+
+From this directory, run `uv run pytest -q` for regression tests and
+`uv run ruff check app tests` for lint checks. Pytest resolves the application from
+this project directory, including when invoked directly through the virtualenv.
+The shared phone lifecycle policy lives in `app/business/call_status.py`; clinic
+and outreach callbacks must use it so late provider callbacks cannot regress a
+call or reopen a terminal outcome. Provider requests in the regression suite are
+mocked; PostgreSQL-specific tests require their configured test database.

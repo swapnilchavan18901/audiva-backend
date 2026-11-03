@@ -43,9 +43,7 @@ def _speak_date(d: date) -> str:
 def _spell_digits(digits: str) -> str:
     """'9175541890' → '9 1 7 5 5, 4 1 8 9 0' (groups of 5 after splitting, pause with a comma)."""
     d = re.sub(r"\D", "", digits)
-    if len(d) == 10:
-        groups = [d[:5], d[5:]]
-    elif len(d) == 11 and d.startswith("0"):  # landline with STD code, e.g. 02194123456
+    if len(d) == 10 or len(d) == 11 and d.startswith("0"):
         groups = [d[:5], d[5:]]
     else:
         groups = [d[i : i + 4] for i in range(0, len(d), 4)]
@@ -68,8 +66,10 @@ def _strip_markdown(t: str) -> str:
     t = re.sub(r"`([^`]*)`", r"\1", t)  # `code`
     t = re.sub(r"(\*\*|__)(.+?)\1", r"\2", t)  # **bold**
     t = re.sub(r"(?<!\w)[*_](.+?)[*_](?!\w)", r"\1", t)  # *italic*
-    t = re.sub(r"^\s*#{1,6}\s*", "", t, flags=re.M)  # # heading
-    t = re.sub(r"^\s*(?:[-*•]|\d+\.)\s+", "", t, flags=re.M)  # - bullet / 1. item
+    t = re.sub(r"^\s*#{1,6}\s*", "", t, flags=re.MULTILINE)  # # heading
+    t = re.sub(
+        r"^\s*(?:[-*•]|\d+\.)\s+", "", t, flags=re.MULTILINE
+    )  # - bullet / 1. item
     return t.replace("*", "").replace("~", "").replace("|", ", ")
 
 
@@ -79,10 +79,14 @@ def _iso_datetimes(t: str) -> str:
             dt = datetime(int(m[2]), int(m[3]), int(m[4]), int(m[5]), int(m[6]))
         except ValueError:
             return m[0]
-        on = "on " if m[1] else ""  # "at 2026-10-12T10:00" → "on Monday 12 October at 10 AM"
+        on = (
+            "on " if m[1] else ""
+        )  # "at 2026-10-12T10:00" → "on Monday 12 October at 10 AM"
         return f"{on}{_speak_date(dt.date())} at {_speak_time(dt.hour, dt.minute)}"
 
-    return re.sub(r"(\bat\s+)?\b(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::\d{2})?\b", repl, t)
+    return re.sub(
+        r"(\bat\s+)?\b(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::\d{2})?\b", repl, t
+    )
 
 
 def _iso_dates(t: str) -> str:
@@ -129,7 +133,7 @@ def _pincodes(t: str) -> str:
         r"(?<![\d,₹])\b(\d{6})\b(?!\s*(?:rupees|rs\b|/-))",
         lambda m: " ".join(m[1]),
         t,
-        flags=re.I,
+        flags=re.IGNORECASE,
     )
 
 
@@ -138,7 +142,9 @@ def _currency(t: str) -> str:
         return s.replace(",", "")
 
     t = re.sub(
-        r"(?:₹|\bRs\.?|\bINR)\s?(\d[\d,]*(?:\.\d+)?)(?:/-)?", lambda m: f"{amount(m[1])} rupees", t
+        r"(?:₹|\bRs\.?|\bINR)\s?(\d[\d,]*(?:\.\d+)?)(?:/-)?",
+        lambda m: f"{amount(m[1])} rupees",
+        t,
     )
     t = re.sub(r"\b(\d[\d,]*)\s?/-", lambda m: f"{amount(m[1])} rupees", t)
     return t
@@ -150,10 +156,14 @@ def _times(t: str) -> str:
         return f"{h} {suffix}" if mi == 0 else f"{h}:{mi:02d} {suffix}"
 
     # 10:00 am / 10:30 P.M. → normalise, drop ":00"
-    t = re.sub(r"\b(\d{1,2}):(\d{2})\s*([AaPp]\.[Mm]\.|[AaPp][Mm])(?![a-z])", with_suffix, t)
+    t = re.sub(
+        r"\b(\d{1,2}):(\d{2})\s*([AaPp]\.[Mm]\.|[AaPp][Mm])(?![a-z])", with_suffix, t
+    )
     # 10am / 5 pm → 10 AM / 5 PM
     t = re.sub(
-        r"\b(\d{1,2})\s*([AaPp])(?:\.[Mm]\.|[Mm])(?![a-z])", lambda m: f"{m[1]} {m[2].upper()}M", t
+        r"\b(\d{1,2})\s*([AaPp])(?:\.[Mm]\.|[Mm])(?![a-z])",
+        lambda m: f"{m[1]} {m[2].upper()}M",
+        t,
     )
     # bare 24-hour 13:30 / 09:00 → 1:30 PM / 9 AM
     t = re.sub(
@@ -168,9 +178,7 @@ def _day_ranges(t: str) -> str:
     def day(abbr: str) -> str:
         return DAYS[abbr[:3].capitalize()]
 
-    pattern = (
-        r"\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*\s*[-–—]\s*(Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*\b"
-    )
+    pattern = r"\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*\s*[-–—]\s*(Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*\b"
     t = re.sub(pattern, lambda m: f"{day(m[1])} to {day(m[2])}", t)
     return re.sub(r"\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\b", lambda m: DAYS[m[1]], t)
 
@@ -178,7 +186,9 @@ def _day_ranges(t: str) -> str:
 def _ranges(t: str) -> str:
     """9–5, 10-12, 9 AM–5 PM → '9 to 5' …  (phones and dates are already handled)."""
     t = re.sub(r"(\d(?:\s?[AP]M)?)\s*[–—]\s*(\d)", r"\1 to \2", t)
-    t = re.sub(r"(?<![\d-])(\d{1,2}(?:\s?[AP]M)?)\s*-\s*(\d{1,2})(?![\d-])", r"\1 to \2", t)
+    t = re.sub(
+        r"(?<![\d-])(\d{1,2}(?:\s?[AP]M)?)\s*-\s*(\d{1,2})(?![\d-])", r"\1 to \2", t
+    )
     return t
 
 
@@ -211,7 +221,9 @@ def _emails(t: str) -> str:
 def _symbols(t: str) -> str:
     t = t.replace("&", " and ").replace("%", " percent")
     t = re.sub(r"\s\+\s", " plus ", t)
-    t = re.sub(r"(?<=\w)/(?=[A-Za-z])", " or ", t)  # morning/evening → morning or evening
+    t = re.sub(
+        r"(?<=\w)/(?=[A-Za-z])", " or ", t
+    )  # morning/evening → morning or evening
     return t
 
 

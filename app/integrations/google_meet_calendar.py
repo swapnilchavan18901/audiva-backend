@@ -3,7 +3,7 @@
 import base64
 import hashlib
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from urllib.parse import quote, urlencode, urlparse
 
 import httpx
@@ -53,26 +53,30 @@ def decrypt(settings, value):
     try:
         return cipher(settings).decrypt(value.encode()).decode()
     except InvalidToken:
-        raise CalendarError("Cannot decrypt credentials; check MEETING_TOKEN_KEY.") from None
+        raise CalendarError(
+            "Cannot decrypt credentials; check MEETING_TOKEN_KEY."
+        ) from None
 
 
 def aware(value):
-    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value
 
 
 def parse_instant(value):
     if not value:
         return None
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    parsed = datetime.fromisoformat(value)
     if parsed.tzinfo is None:
         raise CalendarError("Google returned a timestamp without a timezone.")
-    return parsed.astimezone(timezone.utc)
+    return parsed.astimezone(UTC)
 
 
 def oauth_request(settings, redirect_uri):
     validate_configuration(settings)
     state, verifier = secrets.token_urlsafe(32), secrets.token_urlsafe(64)
-    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=")
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()
+    ).rstrip(b"=")
     url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(
         {
             "client_id": settings.google_client_id,
@@ -110,11 +114,11 @@ def body(response):
         )
     try:
         result = response.json()
-        if not isinstance(result, dict):
-            raise ValueError
-        return result
     except ValueError:
         raise CalendarError("Google returned an invalid response.") from None
+    if not isinstance(result, dict):
+        raise CalendarError("Google returned an invalid response.")
+    return result
 
 
 def token_fields(data):
@@ -163,7 +167,9 @@ async def connect(db, client, settings, code, verifier, redirect_uri):
         or identity.get("email", "").casefold() != settings.meeting_bot_email.casefold()
         or not identity.get("sub")
     ):
-        raise CalendarError("Sign in with the configured, verified MEETING_BOT_EMAIL account.")
+        raise CalendarError(
+            "Sign in with the configured, verified MEETING_BOT_EMAIL account."
+        )
     if existing and existing.google_subject != identity["sub"]:
         raise CalendarError(
             "A different bot account is already connected; account replacement is disabled."
@@ -174,7 +180,9 @@ async def connect(db, client, settings, code, verifier, redirect_uri):
             "No refresh token returned. Revoke this app grant and reconnect with consent."
         )
     if existing is None:
-        existing = MeetingGoogleConnection(google_subject=identity["sub"], email=identity["email"])
+        existing = MeetingGoogleConnection(
+            google_subject=identity["sub"], email=identity["email"]
+        )
         db.add(existing)
     f = cipher(settings)
     if refresh:
@@ -205,7 +213,9 @@ async def access_token(db, client, settings, *, force=False):
     if connection is None or connection.status != "connected":
         raise ReauthorizationRequired("Run the operator connect command first.")
     if connection.email.casefold() != settings.meeting_bot_email.casefold():
-        raise CalendarError("Configured email does not match the connected bot account.")
+        raise CalendarError(
+            "Configured email does not match the connected bot account."
+        )
     if (
         not force
         and connection.access_token_ciphertext
@@ -244,7 +254,9 @@ async def access_token(db, client, settings, *, force=False):
     connection.access_token_ciphertext = f.encrypt(token.encode()).decode()
     connection.access_token_expires_at = expires
     if tokens.get("refresh_token"):
-        connection.refresh_token_ciphertext = f.encrypt(tokens["refresh_token"].encode()).decode()
+        connection.refresh_token_ciphertext = f.encrypt(
+            tokens["refresh_token"].encode()
+        ).decode()
     connection.updated_at = utcnow()
     # Persist rotated credentials even if a later calendar request fails.
     await db.commit()
@@ -329,7 +341,9 @@ async def apply_definition(db, client, calendar, token, data, now):
         return  # Modified/cancelled instances are resolved by the master's instances API.
     meeting = await db.scalar(
         select(Meeting)
-        .where(Meeting.calendar_id == calendar.id, Meeting.provider_event_id == data["id"])
+        .where(
+            Meeting.calendar_id == calendar.id, Meeting.provider_event_id == data["id"]
+        )
         .with_for_update()
     )
     if data.get("status") == "cancelled":
@@ -349,7 +363,11 @@ async def apply_definition(db, client, calendar, token, data, now):
         )
         db.add(meeting)
     organizer = (data.get("organizer", {}).get("email") or "").strip().lower() or None
-    if meeting.organization_id and meeting.organizer_email and organizer != meeting.organizer_email:
+    if (
+        meeting.organization_id
+        and meeting.organizer_email
+        and organizer != meeting.organizer_email
+    ):
         # A transferred series must not silently bring a new organizer's calls into
         # the old workspace. Keep its existing assignment/history and stop future joins.
         meeting.auto_join = False
@@ -384,7 +402,9 @@ async def apply_definition(db, client, calendar, token, data, now):
             token,
             {
                 "timeMin": now.isoformat(),
-                "timeMax": (now + timedelta(days=constants.MEETING_SYNC_DAYS)).isoformat(),
+                "timeMax": (
+                    now + timedelta(days=constants.MEETING_SYNC_DAYS)
+                ).isoformat(),
                 "showDeleted": "false",
                 "maxResults": 2500,
                 "timeZone": "UTC",
@@ -402,7 +422,10 @@ async def apply_definition(db, client, calendar, token, data, now):
     if candidates:
         selected = min(candidates, key=lambda item: (item["start"], item["id"]))
         meeting.next_occurrence_id = selected["id"]
-        meeting.next_starts_at, meeting.next_ends_at = selected["start"], selected["end"]
+        meeting.next_starts_at, meeting.next_ends_at = (
+            selected["start"],
+            selected["end"],
+        )
         meeting.next_meet_url, meeting.next_title = selected["url"], selected["title"]
     meeting.status = "scheduled" if meeting.is_recurring or candidates else "completed"
     await auto_assign_event(db, meeting)
@@ -441,7 +464,9 @@ async def sync_calendar(db, client, calendar, token, settings, now):
     for provider_id in set(known) | exception_masters:
         if provider_id in masters:
             continue
-        response = await calendar_get(client, url + "/" + quote(provider_id, safe=""), token)
+        response = await calendar_get(
+            client, url + "/" + quote(provider_id, safe=""), token
+        )
         masters[provider_id] = (
             {"id": provider_id, "status": "cancelled"}
             if response.status_code in (404, 410)
@@ -467,7 +492,9 @@ async def sync(db, client, settings):
             ).all()
             count = 0
             for calendar in calendars:
-                count += await sync_calendar(db, client, calendar, token, settings, utcnow())
+                count += await sync_calendar(
+                    db, client, calendar, token, settings, utcnow()
+                )
             await db.commit()
             return {"calendars": len(calendars), "events": count}
         except Unauthorized:

@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
@@ -18,7 +18,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
 def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class Base(DeclarativeBase):
@@ -33,7 +33,9 @@ class TurnCredentialState(Base):
 
 class IdentityMixin:
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
 
 
 class User(IdentityMixin, Base):
@@ -49,7 +51,9 @@ class Organization(IdentityMixin, Base):
     __tablename__ = "organizations"
     name: Mapped[str] = mapped_column(String(100))
     # Exactly one personal organization per user; additional organizations have NULL here.
-    personal_for_user_id: Mapped[UUID | None] = mapped_column(ForeignKey("users.id"), unique=True)
+    personal_for_user_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("users.id"), unique=True
+    )
 
 
 class Membership(IdentityMixin, Base):
@@ -61,7 +65,9 @@ class Membership(IdentityMixin, Base):
     organization_id: Mapped[UUID] = mapped_column(
         ForeignKey("organizations.id", ondelete="CASCADE"), index=True
     )
-    user_id: Mapped[UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
     role: Mapped[str] = mapped_column(String(20), default="member")
 
 
@@ -97,7 +103,9 @@ class Bot(IdentityMixin, Base):
         ForeignKey("organizations.id", ondelete="CASCADE"), index=True
     )
     name: Mapped[str] = mapped_column(String(100))
-    template_id: Mapped[UUID] = mapped_column(ForeignKey("bot_templates.id"), index=True)
+    template_id: Mapped[UUID] = mapped_column(
+        ForeignKey("bot_templates.id"), index=True
+    )
     company_context: Mapped[str] = mapped_column(Text, default="")
     language: Mapped[str] = mapped_column(String(20), default="hi-IN")
 
@@ -120,7 +128,9 @@ class VoiceGrant(IdentityMixin, Base):
     api_key_id: Mapped[UUID] = mapped_column(
         ForeignKey("api_keys.id", ondelete="CASCADE"), index=True
     )
-    bot_id: Mapped[UUID] = mapped_column(ForeignKey("bots.id", ondelete="CASCADE"), index=True)
+    bot_id: Mapped[UUID] = mapped_column(
+        ForeignKey("bots.id", ondelete="CASCADE"), index=True
+    )
     token_hash: Mapped[str] = mapped_column(String(64), unique=True)
     offer_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
@@ -129,7 +139,9 @@ class VoiceGrant(IdentityMixin, Base):
 
 class ClinicDoctor(Base):
     __tablename__ = "clinic_doctors"
-    __table_args__ = (UniqueConstraint("bot_id", "name", name="uq_clinic_doctor_bot_name"),)
+    __table_args__ = (
+        UniqueConstraint("bot_id", "name", name="uq_clinic_doctor_bot_name"),
+    )
     bot_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("bots.id", ondelete="CASCADE"), index=True
     )
@@ -140,15 +152,23 @@ class ClinicDoctor(Base):
 
 class ClinicAppointment(IdentityMixin, Base):
     __tablename__ = "clinic_appointments"
-    bot_id: Mapped[UUID] = mapped_column(ForeignKey("bots.id", ondelete="CASCADE"), index=True)
+    bot_id: Mapped[UUID] = mapped_column(
+        ForeignKey("bots.id", ondelete="CASCADE"), index=True
+    )
     doctor_id: Mapped[int] = mapped_column(ForeignKey("clinic_doctors.id"))
     patient_name: Mapped[str] = mapped_column(String(120))
     patient_phone: Mapped[str] = mapped_column(String(20))
-    visited: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
-    start_time: Mapped[datetime] = mapped_column(DateTime)  # fixed Asia/Kolkata local time
+    visited: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false")
+    )
+    start_time: Mapped[datetime] = mapped_column(
+        DateTime
+    )  # fixed Asia/Kolkata local time
     reason: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(20), default="booked")
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
     __table_args__ = (
         CheckConstraint("status IN ('booked', 'cancelled')"),
         Index(
@@ -174,22 +194,30 @@ class MeetingGoogleConnection(IdentityMixin, Base):
             name="ck_meeting_google_status",
         ),
     )
-    singleton_key: Mapped[int] = mapped_column(unique=True, default=1, server_default="1")
+    singleton_key: Mapped[int] = mapped_column(
+        unique=True, default=1, server_default="1"
+    )
     google_subject: Mapped[str] = mapped_column(String(255), unique=True)
     email: Mapped[str] = mapped_column(String(320))
     # Only encrypted envelopes may be written here. The encryption key lives outside the DB.
     refresh_token_ciphertext: Mapped[str] = mapped_column(Text)
     access_token_ciphertext: Mapped[str | None] = mapped_column(Text)
-    access_token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    access_token_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
     granted_scopes: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(20), default="connected")
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
 
 
 class MeetingCalendar(IdentityMixin, Base):
     __tablename__ = "meeting_calendars"
     __table_args__ = (
-        UniqueConstraint("connection_id", "google_calendar_id", name="uq_meeting_calendar"),
+        UniqueConstraint(
+            "connection_id", "google_calendar_id", name="uq_meeting_calendar"
+        ),
     )
     connection_id: Mapped[UUID] = mapped_column(
         ForeignKey("meeting_google_connection.id", ondelete="CASCADE")
@@ -209,7 +237,9 @@ class Meeting(IdentityMixin, Base):
     __tablename__ = "meetings"
     __table_args__ = (
         UniqueConstraint("organization_id", "id", name="uq_meeting_org_id"),
-        UniqueConstraint("calendar_id", "provider_event_id", name="uq_meeting_definition"),
+        UniqueConstraint(
+            "calendar_id", "provider_event_id", name="uq_meeting_definition"
+        ),
         CheckConstraint(
             "(next_occurrence_id IS NULL AND next_starts_at IS NULL AND next_ends_at IS NULL) "
             "OR (next_occurrence_id IS NOT NULL AND next_starts_at IS NOT NULL "
@@ -236,11 +266,15 @@ class Meeting(IdentityMixin, Base):
     status: Mapped[str] = mapped_column(String(20), default="scheduled")
     auto_join: Mapped[bool] = mapped_column(Boolean, default=False)
     next_occurrence_id: Mapped[str | None] = mapped_column(String(1024))
-    next_starts_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    next_starts_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
     next_ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     next_meet_url: Mapped[str | None] = mapped_column(Text)
     next_title: Mapped[str | None] = mapped_column(String(500))
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
 
     # Compatibility fields for the existing dashboard/inbox API.
     @property
@@ -294,13 +328,17 @@ class MeetingCapture(IdentityMixin, Base):
     provider_bot_id: Mapped[str | None] = mapped_column(String(100), unique=True)
     speaker_names: Mapped[dict] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(30), default="starting")
-    detail: Mapped[str] = mapped_column(Text, default="Connecting the meeting voice agent.")
+    detail: Mapped[str] = mapped_column(
+        Text, default="Connecting the meeting voice agent."
+    )
     provider_status: Mapped[str | None] = mapped_column(String(100))
     transcript: Mapped[list] = mapped_column(JSON, default=list)
     memory_status: Mapped[str] = mapped_column(String(20), default="pending")
     memory_error: Mapped[str | None] = mapped_column(Text)
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
 
 
 class MeetingMemory(Base):
@@ -311,7 +349,9 @@ class MeetingMemory(Base):
         ForeignKey("organizations.id", ondelete="CASCADE"), primary_key=True
     )
     context: Mapped[str] = mapped_column(Text, default="")
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
 
 
 class OutreachAgent(IdentityMixin, Base):
@@ -328,7 +368,9 @@ class OutreachCampaign(IdentityMixin, Base):
     __tablename__ = "outreach_campaigns"
     __table_args__ = (
         CheckConstraint("mode IN ('sequential', 'parallel')"),
-        CheckConstraint("status IN ('draft', 'running', 'stopping', 'completed', 'cancelled')"),
+        CheckConstraint(
+            "status IN ('draft', 'running', 'stopping', 'completed', 'cancelled')"
+        ),
     )
     organization_id: Mapped[UUID] = mapped_column(
         ForeignKey("organizations.id", ondelete="CASCADE"), index=True

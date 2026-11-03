@@ -24,6 +24,7 @@ from app.ai.common.twilio import stream_xml, validate_start
 from app.api.dependencies import DB, CurrentUser
 from app.api.phone_callbacks import read_payload
 from app.business import outreach
+from app.business.call_status import ACTIVE_CALL_STATUSES
 from app.clients.twilio import callback_status
 from app.clients.twilio_logging import logger, safe_detail
 from app.db.models import OutreachAgent, OutreachCall, OutreachCampaign, utcnow
@@ -338,7 +339,7 @@ async def twilio_media(websocket: WebSocket, call_id: UUID, token: str = ""):
             )
             if (
                 not call
-                or call.status not in outreach.ACTIVE
+                or call.status not in ACTIVE_CALL_STATUSES
                 or call.stream_claimed
                 or (
                     call.provider_call_sid

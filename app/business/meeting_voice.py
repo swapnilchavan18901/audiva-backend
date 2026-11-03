@@ -54,7 +54,9 @@ class MeetingVoiceService:
     def __init__(self, settings):
         for name in ("uvicorn.error", "uvicorn.access"):
             logger = logging.getLogger(name)
-            if not any(isinstance(item, AudioGrantLogFilter) for item in logger.filters):
+            if not any(
+                isinstance(item, AudioGrantLogFilter) for item in logger.filters
+            ):
                 logger.addFilter(AudioGrantLogFilter())
         self.settings = settings
         self.attendee = AttendeeClient(settings)
@@ -97,9 +99,13 @@ class MeetingVoiceService:
         return {
             "meeting_id": meeting.id,
             "capture_id": capture.id if capture else None,
-            "provider_occurrence_id": capture.provider_occurrence_id if capture else None,
+            "provider_occurrence_id": capture.provider_occurrence_id
+            if capture
+            else None,
             "status": capture.status if capture else "idle",
-            "detail": capture.detail if capture else "The assistant has not joined this meeting.",
+            "detail": capture.detail
+            if capture
+            else "The assistant has not joined this meeting.",
             "updated_at": capture.updated_at if capture else None,
             "voice_state": runtime.phase if runtime else "disconnected",
             "voice_error": runtime.error if runtime else None,
@@ -110,19 +116,31 @@ class MeetingVoiceService:
                 and not active
                 and not runtime
                 and meeting.status != "cancelled"
-                and (not capture or capture.provider_occurrence_id != meeting.next_occurrence_id)
+                and (
+                    not capture
+                    or capture.provider_occurrence_id != meeting.next_occurrence_id
+                )
             ),
         }
 
     async def capture(self, db, meeting_id, lock=False):
         # Active captures can belong to an earlier occurrence than the current next pointer.
-        statement = select(MeetingCapture).where(MeetingCapture.meeting_id == meeting_id)
+        statement = select(MeetingCapture).where(
+            MeetingCapture.meeting_id == meeting_id
+        )
         if lock:
             statement = statement.with_for_update()
         active = await db.scalar(
             statement.where(
                 MeetingCapture.status.in_(
-                    {"starting", "unknown", "joining", "waiting", "connected", "stopping"}
+                    {
+                        "starting",
+                        "unknown",
+                        "joining",
+                        "waiting",
+                        "connected",
+                        "stopping",
+                    }
                 )
             )
             .order_by(MeetingCapture.created_at.desc())
@@ -143,10 +161,14 @@ class MeetingVoiceService:
             )
         if self.closing:
             raise HTTPException(503, "The meeting voice service is shutting down.")
-        await db.execute(select(Meeting.id).where(Meeting.id == meeting.id).with_for_update())
+        await db.execute(
+            select(Meeting.id).where(Meeting.id == meeting.id).with_for_update()
+        )
         await db.refresh(meeting)
         if not meeting.organization_id:
-            raise HTTPException(409, "Assign this meeting to a workspace before joining")
+            raise HTTPException(
+                409, "Assign this meeting to a workspace before joining"
+            )
         if meeting.status == "cancelled":
             raise HTTPException(409, "Cancelled meetings cannot be joined")
         if (
@@ -155,7 +177,8 @@ class MeetingVoiceService:
             or not meeting.next_starts_at
             or not meeting.next_ends_at
             or aware(meeting.next_ends_at) <= utcnow()
-            or aware(meeting.next_starts_at) > utcnow() + timedelta(minutes=0 if scheduled else 10)
+            or aware(meeting.next_starts_at)
+            > utcnow() + timedelta(minutes=0 if scheduled else 10)
         ):
             raise HTTPException(409, "No occurrence is currently available to join")
         capture = await db.scalar(
@@ -190,7 +213,9 @@ class MeetingVoiceService:
         )
         db.add(capture)
         await db.flush()
-        await db.commit()  # Durable deduplication identity before external side effects.
+        await (
+            db.commit()
+        )  # Durable deduplication identity before external side effects.
         token = jwt.encode(
             {
                 "sub": str(capture.id),
@@ -227,11 +252,13 @@ class MeetingVoiceService:
             capture.provider_bot_id = bot["id"]
             self.apply_state(capture, meeting, bot.get("state", "joining"))
         except HTTPException as error:
-            capture.status = "unknown" if "did not respond" in error.detail else "failed"
+            capture.status = (
+                "unknown" if "did not respond" in error.detail else "failed"
+            )
             capture.detail = error.detail
             await db.commit()
             raise
-        except Exception:
+        except Exception:  # noqa: BLE001 - any provider failure may have created a bot
             capture.status = "unknown"
             capture.detail = (
                 "The meeting connection is unconfirmed. Contact your administrator before retrying; "
@@ -263,12 +290,18 @@ class MeetingVoiceService:
 
     async def status(self, db, meeting, capture=None):
         capture = capture or await self.capture(db, meeting.id)
-        if capture and capture.provider_bot_id and capture.provider_status not in TERMINAL:
+        if (
+            capture
+            and capture.provider_bot_id
+            and capture.provider_status not in TERMINAL
+        ):
             synced = capture.last_synced_at
             if synced and synced.tzinfo is None:
                 synced = synced.replace(tzinfo=utcnow().tzinfo)
             if not synced or utcnow() - synced > timedelta(seconds=15):
-                bot = await self.attendee.request("GET", f"bots/{capture.provider_bot_id}")
+                bot = await self.attendee.request(
+                    "GET", f"bots/{capture.provider_bot_id}"
+                )
                 self.apply_state(capture, meeting, bot.get("state", "joining"))
                 try:
                     events = await self.attendee.request(
@@ -278,7 +311,9 @@ class MeetingVoiceService:
                         events = events.get("results", [])
                     names = dict(capture.speaker_names)
                     for event in events:
-                        if event.get("participant_uuid") and event.get("participant_name"):
+                        if event.get("participant_uuid") and event.get(
+                            "participant_name"
+                        ):
                             names[event["participant_uuid"]] = event["participant_name"]
                     capture.speaker_names = names
                 except HTTPException:
@@ -292,9 +327,16 @@ class MeetingVoiceService:
 
     async def stop(self, db, meeting):
         capture = await self.capture(db, meeting.id, lock=True)
-        if capture and capture.provider_bot_id and capture.provider_status not in TERMINAL:
+        if (
+            capture
+            and capture.provider_bot_id
+            and capture.provider_status not in TERMINAL
+        ):
             await self.attendee.request("POST", f"bots/{capture.provider_bot_id}/leave")
-            capture.status, capture.detail = "stopping", "The assistant is leaving the meeting."
+            capture.status, capture.detail = (
+                "stopping",
+                "The assistant is leaving the meeting.",
+            )
             capture.updated_at = utcnow()
             await db.commit()
             runtime = self.live.get(capture.id)
@@ -313,7 +355,9 @@ class MeetingVoiceService:
         }
         async with SessionFactory() as db:
             capture = await db.scalar(
-                select(MeetingCapture).where(MeetingCapture.id == capture_id).with_for_update()
+                select(MeetingCapture)
+                .where(MeetingCapture.id == capture_id)
+                .with_for_update()
             )
             entry["speaker_id"] = speaker
             entry["speaker"] = capture.speaker_names.get(speaker, speaker)
@@ -384,11 +428,11 @@ class MeetingVoiceService:
 
                     message = json.loads(raw)
                     if not isinstance(message, dict):
-                        raise ValueError("Expected an audio object")
+                        raise TypeError("Expected an audio object")
                     await runtime.receive_audio(message)
         except WebSocketDisconnect:
             pass
-        except (ValueError, TimeoutError, asyncio.QueueFull):
+        except (ValueError, TypeError, TimeoutError, asyncio.QueueFull):
             await websocket.close(code=1008)
         finally:
             runtime.interrupt()

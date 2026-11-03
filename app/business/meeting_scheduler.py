@@ -20,9 +20,11 @@ async def repeat(action, seconds):
     while True:
         try:
             await action()
-        except Exception:
+        except Exception:  # noqa: BLE001 - isolate failed background work and retry
             # Do not log provider bodies, transcript contents or credentials.
-            logger.warning("Meeting background operation %s failed; retrying", action.__name__)
+            logger.warning(
+                "Meeting background operation %s failed; retrying", action.__name__
+            )
         await asyncio.sleep(seconds)
 
 
@@ -50,7 +52,8 @@ def start(service):
                         ~select(MeetingCapture.id)
                         .where(
                             MeetingCapture.meeting_id == Meeting.id,
-                            MeetingCapture.provider_occurrence_id == Meeting.next_occurrence_id,
+                            MeetingCapture.provider_occurrence_id
+                            == Meeting.next_occurrence_id,
                         )
                         .exists(),
                     )
@@ -61,7 +64,7 @@ def start(service):
                 async with SessionFactory() as db:
                     meeting = await db.get(Meeting, meeting_id)
                     await service.start(db, meeting, scheduled=True)
-            except Exception:
+            except Exception:  # noqa: BLE001 - isolate failed background work and retry
                 logger.warning("Automatic join failed for meeting %s", meeting_id)
 
     async def statuses():
@@ -82,7 +85,7 @@ def start(service):
                     capture = await db.get(MeetingCapture, capture_id)
                     meeting = await db.get(Meeting, capture.meeting_id)
                     await service.status(db, meeting, capture=capture)
-            except Exception:
+            except Exception:  # noqa: BLE001 - isolate failed background work and retry
                 logger.warning("Meeting status refresh failed for %s", capture_id)
 
     async def memories():
@@ -100,12 +103,14 @@ def start(service):
                 continue
             try:
                 await service.memory.update(capture_id)
-            except Exception:
+            except Exception:  # noqa: BLE001 - isolate failed background work and retry
                 async with SessionFactory() as db:
                     capture = await db.get(MeetingCapture, capture_id)
                     if capture:
                         capture.memory_status = "failed"
-                        capture.memory_error = "Memory update failed; automatic retry is pending."
+                        capture.memory_error = (
+                            "Memory update failed; automatic retry is pending."
+                        )
                         await db.commit()
 
     jobs = [(service.memory.cleanup, constants.MEETING_RETENTION_CLEANUP_SECONDS)]
@@ -120,4 +125,6 @@ def start(service):
         jobs.extend(((dispatch, 10), (statuses, 15)))
     if settings.sarvam_api_key.get_secret_value():
         jobs.append((memories, constants.MEETING_MEMORY_PROCESS_SECONDS))
-    service.tasks = [asyncio.create_task(repeat(action, seconds)) for action, seconds in jobs]
+    service.tasks = [
+        asyncio.create_task(repeat(action, seconds)) for action, seconds in jobs
+    ]

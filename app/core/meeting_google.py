@@ -18,7 +18,12 @@ from app.clients import create_google_client
 from app.db.models import MeetingGoogleConnection, User
 from app.db.session import SessionFactory, engine
 from app.env import get_settings
-from app.integrations.google_meet_calendar import CalendarError, connect, oauth_request, sync
+from app.integrations.google_meet_calendar import (
+    CalendarError,
+    connect,
+    oauth_request,
+    sync,
+)
 
 
 def receive_code(settings, open_browser=True):
@@ -53,12 +58,17 @@ def receive_code(settings, open_browser=True):
             self.send_header("Cache-Control", "no-store")
             self.send_header("Referrer-Policy", "no-referrer")
             self.end_headers()
-            self.wfile.write(b"Authorization received. Return to the terminal for the result.")
+            self.wfile.write(
+                b"Authorization received. Return to the terminal for the result."
+            )
 
     with HTTPServer(("127.0.0.1", 0), Callback) as server:
         redirect_uri = f"http://127.0.0.1:{server.server_port}/callback"
         url, expected_state, verifier = oauth_request(settings, redirect_uri)
-        print("Open this URL on this computer to connect the configured bot account:\n" + url)
+        print(
+            "Open this URL on this computer to connect the configured bot account:\n"
+            + url
+        )
         if open_browser:
             webbrowser.open(url)
         deadline = time.monotonic() + 600
@@ -77,7 +87,9 @@ async def run(command, no_browser=False):
     try:
         credentials = None
         if command == "connect":
-            credentials = await asyncio.to_thread(receive_code, settings, not no_browser)
+            credentials = await asyncio.to_thread(
+                receive_code, settings, not no_browser
+            )
         async with SessionFactory() as db, create_google_client() as client:
             if command == "connect":
                 await connect(db, client, settings, *credentials)
@@ -105,7 +117,9 @@ async def link_organizer(user_id, email=None):
             if not user:
                 raise CalendarError("Dashboard user not found.")
             if email and user.email.strip().lower() != email.strip().lower():
-                raise CalendarError("Calendar email must match the verified dashboard account.")
+                raise CalendarError(
+                    "Calendar email must match the verified dashboard account."
+                )
             user.calendar_email = email.strip().lower() if email else None
             try:
                 await db.commit()
@@ -114,7 +128,9 @@ async def link_organizer(user_id, email=None):
                 raise CalendarError(
                     "That calendar email is already linked to another account."
                 ) from None
-            print("Calendar identity linked." if email else "Calendar identity unlinked.")
+            print(
+                "Calendar identity linked." if email else "Calendar identity unlinked."
+            )
     finally:
         await engine.dispose()
 
@@ -123,7 +139,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "command",
-        choices=["connect", "sync", "status", "keygen", "link-organizer", "unlink-organizer"],
+        choices=[
+            "connect",
+            "sync",
+            "status",
+            "keygen",
+            "link-organizer",
+            "unlink-organizer",
+        ],
     )
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--user-id", type=UUID)
@@ -134,14 +157,17 @@ def main():
         return
     try:
         if args.command in {"link-organizer", "unlink-organizer"}:
-            if not args.user_id or (args.command == "link-organizer" and not args.email):
+            if not args.user_id or (
+                args.command == "link-organizer" and not args.email
+            ):
                 parser.error(
                     "link-organizer requires --user-id and --email; "
                     "unlink-organizer requires --user-id"
                 )
             asyncio.run(
                 link_organizer(
-                    args.user_id, args.email if args.command == "link-organizer" else None
+                    args.user_id,
+                    args.email if args.command == "link-organizer" else None,
                 )
             )
         else:

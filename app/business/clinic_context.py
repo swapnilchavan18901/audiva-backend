@@ -79,13 +79,18 @@ def markdown_details(context):
             if mapped:
                 facts[mapped] = value
             if key == "appointment length":
-                match = re.fullmatch(r"(\d+)\s*minutes?", value, re.I)
+                match = re.fullmatch(r"(\d+)\s*minutes?", value, re.IGNORECASE)
                 if match:
                     facts["slot_minutes"] = int(match[1])
             if key == "hours":
-                clocks = re.findall(r"\d{1,2}(?::\d{2})?\s*(?:AM|PM)", value, re.I)
+                clocks = re.findall(
+                    r"\d{1,2}(?::\d{2})?\s*(?:AM|PM)", value, re.IGNORECASE
+                )
                 if len(clocks) in (2, 4):
-                    facts["open_time"], facts["close_time"] = _clock(clocks[0]), _clock(clocks[-1])
+                    facts["open_time"], facts["close_time"] = (
+                        _clock(clocks[0]),
+                        _clock(clocks[-1]),
+                    )
                     if len(clocks) == 4:
                         facts["lunch_start"], facts["lunch_end"] = (
                             _clock(clocks[1]),
@@ -101,7 +106,7 @@ def markdown_details(context):
                     "sunday",
                 ]
                 days = [i for i, name in enumerate(weekdays) if name in value.lower()]
-                if len(days) == 2 and re.search(r"[–—-]|\bto\b", value, re.I):
+                if len(days) == 2 and re.search(r"[–—-]|\bto\b", value, re.IGNORECASE):
                     days = list(range(days[0], days[1] + 1))
                 if days:
                     facts["working_days"] = days
@@ -109,7 +114,11 @@ def markdown_details(context):
         if not line.startswith("|"):
             continue
         cells = [_clean(c) for c in line.strip("|").split("|")]
-        if len(cells) < 2 or cells[0].lower() == "doctor" or set(cells[0]) <= {"-", ":", " "}:
+        if (
+            len(cells) < 2
+            or cells[0].lower() == "doctor"
+            or set(cells[0]) <= {"-", ":", " "}
+        ):
             continue
         if section == "doctors":
             doctors[cells[0]] = {"name": cells[0], "specialty": cells[1]}
@@ -147,21 +156,25 @@ def details(context):
     if not isinstance(data, dict) or "clinic" not in data:
         return ClinicDetails()
     try:
-        base = markdown_details(data.get("background", "")).model_dump(exclude_none=True)
+        base = markdown_details(data.get("background", "")).model_dump(
+            exclude_none=True
+        )
         overrides = data["clinic"]
         if not isinstance(overrides, dict):
-            raise ValueError("clinic must be an object")
+            raise TypeError("clinic must be an object")
         if "doctors" in overrides and isinstance(overrides["doctors"], list):
             previous = {d["name"]: d for d in base["doctors"]}
             overrides = {
                 **overrides,
                 "doctors": [
-                    {**previous.get(d.get("name"), {}), **d} if isinstance(d, dict) else d
+                    {**previous.get(d.get("name"), {}), **d}
+                    if isinstance(d, dict)
+                    else d
                     for d in overrides["doctors"]
                 ],
             }
         return ClinicDetails.model_validate({**base, **overrides})
-    except (ValidationError, ValueError) as exc:
+    except (ValidationError, ValueError, TypeError) as exc:
         raise HTTPException(422, "Invalid clinic context: " + str(exc)) from None
 
 
@@ -180,7 +193,9 @@ async def sync_doctors(db, bot):
     profile = details(bot.company_context)
     existing = {
         d.name: d
-        for d in (await db.scalars(select(ClinicDoctor).where(ClinicDoctor.bot_id == bot.id))).all()
+        for d in (
+            await db.scalars(select(ClinicDoctor).where(ClinicDoctor.bot_id == bot.id))
+        ).all()
     }
     for doc in profile.doctors:
         if doc.name in existing:
@@ -189,5 +204,3 @@ async def sync_doctors(db, bot):
             db.add(ClinicDoctor(bot_id=bot.id, name=doc.name, specialty=doc.specialty))
     # Removed doctors remain for historical appointment references, but are not bookable.
     await db.flush()
-
-

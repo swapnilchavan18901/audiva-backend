@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import binascii
+import logging
 import re
 import time
 from dataclasses import dataclass, field
@@ -13,6 +14,8 @@ from pipecat.audio.vad.vad_analyzer import VADParams, VADState
 from app.ai.meeting.prompts import scope_refusal
 from app.constants import constants
 from app.utils.filler import with_filler
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -28,7 +31,15 @@ class Speaker:
 
 class MeetingVoice:
     def __init__(
-        self, websocket, capture, meeting, speech, save_turn, history, settings, get_memory=None
+        self,
+        websocket,
+        capture,
+        meeting,
+        speech,
+        save_turn,
+        history,
+        settings,
+        get_memory=None,
     ):
         self.websocket, self.capture, self.meeting = websocket, capture, meeting
         self.speech, self.save_turn, self.settings = speech, save_turn, settings
@@ -44,7 +55,7 @@ class MeetingVoice:
         name = re.escape(constants.MEETING_VOICE_NAME)
         self.address = re.compile(
             rf"^\s*(?:(?:hey|hi|hello|okay|ok)\s*[,!]?\s*)?{name}(?:\b|(?=[,!?]))[\s,:!?-]*(.*)$",
-            re.I,
+            re.IGNORECASE,
         )
 
     def interrupt(self):
@@ -105,10 +116,17 @@ class MeetingVoice:
                     if len(speaker.audio) >= 6400:
                         try:
                             self.queue.put_nowait(
-                                (participant, bytes(speaker.audio), True, self.generation)
+                                (
+                                    participant,
+                                    bytes(speaker.audio),
+                                    True,
+                                    self.generation,
+                                )
                             )
                         except asyncio.QueueFull:
-                            self.error = "Speech processing is overloaded; a turn was skipped."
+                            self.error = (
+                                "Speech processing is overloaded; a turn was skipped."
+                            )
                     speaker.audio.clear()
                     speaker.active = False
                     speaker.preroll = b""
@@ -120,7 +138,11 @@ class MeetingVoice:
             speaker = self.speakers[participant]
             if benchmark and speaker.benchmark_turn is None:
                 speaker.benchmark_turn = benchmark.next_turn()
-            token = benchmark.context_turn.set(speaker.benchmark_turn) if benchmark else None
+            token = (
+                benchmark.context_turn.set(speaker.benchmark_turn)
+                if benchmark
+                else None
+            )
             try:
                 text = await self.speech.transcribe(audio) if audio else ""
                 if text:
@@ -139,7 +161,9 @@ class MeetingVoice:
                     question = text
                 elif match:
                     self.armed.pop(participant, None)
-                entry = await self.save_turn(participant, text, "user", question is not None)
+                entry = await self.save_turn(
+                    participant, text, "user", question is not None
+                )
                 self.history.append(entry)
                 self.history = self.history[-60:]
                 # A newer human turn invalidates delayed STT/AI replies.
@@ -149,10 +173,12 @@ class MeetingVoice:
                     and not any(speaker.active for speaker in self.speakers.values())
                 ):
                     self.error = None
-                    self.answer_task = asyncio.create_task(self.reply(question, generation))
+                    self.answer_task = asyncio.create_task(
+                        self.reply(question, generation)
+                    )
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception:  # noqa: BLE001 - keep other speakers and turns alive
                 self.error = "A speech turn could not be processed. The assistant is still listening."
             finally:
                 if benchmark:
@@ -164,7 +190,9 @@ class MeetingVoice:
     async def reply(self, question, generation):
         async def prepare_answer():
             memory = await self.get_memory() if self.get_memory else ""
-            if not await self.speech.is_in_scope(question, self.meeting, self.history, memory):
+            if not await self.speech.is_in_scope(
+                question, self.meeting, self.history, memory
+            ):
                 response = scope_refusal(constants.MEETING_VOICE_LANGUAGE)
             else:
                 response = await self.speech.answer(
@@ -181,8 +209,8 @@ class MeetingVoice:
                     self.phase = "thinking"
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                pass  # Filler failure must never discard the real answer.
+            except Exception as exc:  # noqa: BLE001 - optional filler must not discard the answer
+                logger.debug("Meeting filler failed error_type=%s", type(exc).__name__)
 
         try:
             self.phase = "thinking"
@@ -195,12 +223,16 @@ class MeetingVoice:
             if generation != self.generation:
                 return
             # Filler speech never enters this transcript or the answer context.
-            entry = await self.save_turn(constants.MEETING_VOICE_NAME, response, "bot", False)
+            entry = await self.save_turn(
+                constants.MEETING_VOICE_NAME, response, "bot", False
+            )
             self.history.append(entry)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            self.error = "The assistant could not finish its reply. It is still listening."
+        except Exception:  # noqa: BLE001 - recover the session after a failed reply
+            self.error = (
+                "The assistant could not finish its reply. It is still listening."
+            )
         finally:
             if generation == self.generation:
                 self.phase = "listening"
@@ -227,7 +259,9 @@ class MeetingVoice:
                 {
                     "trigger": "realtime_audio.bot_output",
                     "data": {
-                        "chunk": base64.b64encode(audio[offset : offset + frame_bytes]).decode(),
+                        "chunk": base64.b64encode(
+                            audio[offset : offset + frame_bytes]
+                        ).decode(),
                         "sample_rate": sample_rate,
                     },
                 }
@@ -241,4 +275,6 @@ class MeetingVoice:
         self.interrupt()
         if self.answer_task:
             await asyncio.gather(self.answer_task, return_exceptions=True)
-        await asyncio.gather(*(speaker.vad.cleanup() for speaker in self.speakers.values()))
+        await asyncio.gather(
+            *(speaker.vad.cleanup() for speaker in self.speakers.values())
+        )

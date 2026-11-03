@@ -9,6 +9,7 @@ from cryptography.fernet import Fernet
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
 
 
 class Settings(BaseSettings):
@@ -17,7 +18,9 @@ class Settings(BaseSettings):
         extra="ignore",
         hide_input_in_errors=True,
     )
-    database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/voice_bots"
+    database_url: str = (
+        "postgresql+asyncpg://postgres:postgres@localhost:5432/voice_bots"
+    )
     jwt_secret: SecretStr = Field(min_length=32)
     cors_origins: list[str] = ["http://localhost:3000", "http://127.0.0.1:3000"]
     sarvam_api_key: SecretStr = SecretStr("")
@@ -44,7 +47,7 @@ class Settings(BaseSettings):
             url = make_url(value)
             if url.drivername not in {"postgresql+asyncpg", "sqlite+aiosqlite"}:
                 raise ValueError
-        except Exception:
+        except (ArgumentError, ValueError):
             raise ValueError(
                 "DATABASE_URL must use postgresql+asyncpg or sqlite+aiosqlite"
             ) from None
@@ -52,7 +55,7 @@ class Settings(BaseSettings):
 
     @field_validator("public_backend_url")
     @classmethod
-    def valid_service_url(cls, value, info):
+    def valid_service_url(cls, value):
         if not value:
             return value
         url = urlsplit(value)
@@ -69,7 +72,7 @@ class Settings(BaseSettings):
                 "Expected an absolute service URL without credentials, query or fragment"
             )
         try:
-            url.port
+            _ = url.port  # Access validates the parsed port.
         except ValueError:
             raise ValueError("Invalid service URL port") from None
         return value
@@ -78,7 +81,9 @@ class Settings(BaseSettings):
     @classmethod
     def valid_jwt_secret(cls, value):
         if len(value.get_secret_value().strip()) < 32:
-            raise ValueError("JWT_SECRET must contain at least 32 non-padding characters")
+            raise ValueError(
+                "JWT_SECRET must contain at least 32 non-padding characters"
+            )
         return value
 
     @field_validator("meeting_token_key")
@@ -88,7 +93,9 @@ class Settings(BaseSettings):
             try:
                 Fernet(value.get_secret_value().encode())
             except (ValueError, TypeError):
-                raise ValueError("MEETING_TOKEN_KEY must be a valid Fernet key") from None
+                raise ValueError(
+                    "MEETING_TOKEN_KEY must be a valid Fernet key"
+                ) from None
         return value
 
     @field_validator("cors_origins")
@@ -105,7 +112,9 @@ class Settings(BaseSettings):
                 or url.fragment
                 or url.path
             ):
-                raise ValueError("CORS_ORIGINS must contain HTTP(S) origins without paths")
+                raise ValueError(
+                    "CORS_ORIGINS must contain HTTP(S) origins without paths"
+                )
         return values
 
 

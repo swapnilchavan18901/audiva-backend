@@ -3,12 +3,10 @@
 from fastapi import HTTPException
 from sqlalchemy import select, update
 
+from app.business.call_status import ACTIVE_CALL_STATUSES
 from app.business.organizations import require_membership
 from app.constants.constants import MANAGE_ROLES
 from app.db.models import OutreachAgent, OutreachCall, OutreachCampaign, utcnow
-
-TERMINAL = {"completed", "failed", "busy", "no-answer", "cancelled"}
-ACTIVE = {"dialing", "unknown", "queued", "ringing", "in-progress"}
 
 
 async def access(db, org_id, user_id, write=False):
@@ -90,7 +88,10 @@ async def stop(db, org_id, campaign_id, user_id):
     )
     active = await db.scalar(
         select(OutreachCall.id)
-        .where(OutreachCall.campaign_id == record.id, OutreachCall.status.in_(ACTIVE))
+        .where(
+            OutreachCall.campaign_id == record.id,
+            OutreachCall.status.in_(ACTIVE_CALL_STATUSES),
+        )
         .limit(1)
     )
     record.status = "stopping" if active else "cancelled"
