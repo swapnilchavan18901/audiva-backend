@@ -14,7 +14,7 @@ No credentials or manual setup are needed. Demo users have ordinary workspace ow
 permissions and cannot access other workspaces or platform operator controls.
 Voice demos use the configured voice provider. Demo workspaces persist in the
 database; there is currently no automatic cleanup or reset of an existing session.
-Demo access defaults off in production; `DEMO_ENABLED` and
+Demo access defaults on in every environment; `DEMO_ENABLED` and
 `REGISTRATION_ENABLED` control the actions advertised by `/api/v1/auth/options`.
 
 ## Purpose and architectural approach

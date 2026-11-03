@@ -251,10 +251,11 @@ def production_settings(**values):
     return settings(**config)
 
 
-def test_production_disables_demo_by_default_and_keeps_it_configurable():
+def test_demo_stays_enabled_in_production_and_keeps_it_configurable():
     assert settings().demo_allowed
-    assert not production_settings().demo_allowed
+    assert production_settings().demo_allowed
     assert production_settings(demo_enabled=True).demo_allowed
+    assert not production_settings(demo_enabled=False).demo_allowed
 
 
 @pytest.mark.parametrize(
@@ -423,7 +424,7 @@ def test_production_preflight_does_not_mutate_runtime_settings():
     )
     checked = production_config(config)
     assert checked.app_environment == "production"
-    assert not checked.demo_allowed
+    assert checked.demo_allowed
     assert config.app_environment == "development"
     assert config.demo_allowed
 

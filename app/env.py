@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     app_environment: Literal["development", "test", "production"] = "development"
     registration_enabled: bool = True
     auth_max_concurrency: int = Field(default=4, ge=1, le=16)
-    demo_enabled: bool | None = None
+    demo_enabled: bool = True
     api_requests_per_minute: int = Field(default=2400, ge=1, le=100000)
     user_requests_per_minute: int = Field(default=1200, ge=1, le=100000)
     login_requests_per_minute: int = Field(default=10, ge=1, le=1000)
@@ -60,11 +60,7 @@ class Settings(BaseSettings):
 
     @property
     def demo_allowed(self):
-        return (
-            self.demo_enabled
-            if self.demo_enabled is not None
-            else self.app_environment != "production"
-        )
+        return self.demo_enabled
 
     @model_validator(mode="after")
     def production_configuration(self):
