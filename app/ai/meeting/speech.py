@@ -7,11 +7,12 @@ import json
 import wave
 
 from app.ai.benchmark import Benchmark
+from app.ai.meeting.prompts import scope_refusal
 from app.clients import create_sarvam_client
 from app.constants import constants
 from app.constants.constants import SCOPE_POLICY
 from app.db.models import utcnow
-from app.types import ScopeDecision, SpokenReply
+from app.types import SpokenReply
 from app.utils.filler import filler_text
 from app.utils.text_normalizer import normalize_for_speech
 
@@ -82,42 +83,6 @@ class MeetingSpeech:
         response.raise_for_status()
         return response.json().get("transcript", "").strip()
 
-    async def is_in_scope(self, question, meeting, transcript, memory=""):
-        evidence = [
-            {"speaker": entry.get("speaker"), "text": entry.get("text")}
-            for entry in transcript[-60:]
-            if entry.get("role", "user") == "user" and not entry.get("addressed")
-        ]
-        response = await self._post(
-            "/v1/chat/completions",
-            operation="is_in_scope",
-            json={
-                "model": constants.SARVAM_LLM_MODEL,
-                "max_tokens": 40,
-                "response_format": {"type": "json_object"},
-                "messages": [
-                    {"role": "system", "content": SCOPE_POLICY},
-                    {
-                        "role": "user",
-                        "content": json.dumps(
-                            {
-                                "question": question,
-                                "agenda": meeting.agenda,
-                                "participant_evidence": evidence,
-                                "past_meeting_memory": memory,
-                                "current_date_utc": utcnow().date().isoformat(),
-                            },
-                            ensure_ascii=False,
-                        ),
-                    },
-                ],
-            },
-        )
-        response.raise_for_status()
-        content = response.json()["choices"][0]["message"].get("content")
-        # Invalid or missing decisions raise; they never enable an answer.
-        return ScopeDecision.model_validate_json(content).in_scope
-
     async def filler_audio(self):
         async with self._filler_lock:
             if self._filler_audio is None:
@@ -147,14 +112,19 @@ class MeetingSpeech:
             operation="answer",
             json={
                 "model": constants.SARVAM_LLM_MODEL,
-                "max_tokens": 250,
+                "max_tokens": 1024,
                 "response_format": {"type": "json_object"},
                 "messages": [
                     {
                         "role": "system",
                         "content": (
                             f"You are {constants.MEETING_VOICE_NAME}, a meeting assistant. "
-                            'Return JSON with exactly one field: "spoken_answer". '
+                            + SCOPE_POLICY
+                            + '\nReturn JSON with exactly two fields: "in_scope" (boolean) '
+                            'and "spoken_answer" (string). For an out-of-scope request, '
+                            "set in_scope to false and spoken_answer to an empty string. "
+                            "For an in-scope request, set in_scope to true and provide the answer. "
+                            "The output token limit is a ceiling, never a target. "
                             "Answer the CURRENT QUESTION directly, usually in one or two "
                             "short sentences and at most 60 words. Start with the answer, "
                             "not with an introduction or a description of your evidence. "
@@ -214,7 +184,12 @@ class MeetingSpeech:
         if not isinstance(content, str) or not content.strip():
             raise ValueError("The model did not return a spoken answer")
         # Only the answer is spoken; never forward the response envelope or transcript.
-        return SpokenReply.model_validate_json(content).spoken_answer.strip()
+        reply = SpokenReply.model_validate_json(content)
+        if not reply.in_scope:
+            return scope_refusal(constants.MEETING_VOICE_LANGUAGE)
+        if not reply.spoken_answer.strip():
+            raise ValueError("The model returned an empty in-scope answer")
+        return reply.spoken_answer.strip()
 
     async def synthesize(self, text):
         spoken = normalize_for_speech(text, constants.MEETING_VOICE_LANGUAGE)

@@ -24,6 +24,7 @@ __pycache__/
 /tests/*
 !/tests/test_outreach.py
 !/tests/test_meeting_definitions.py
+!/tests/test_meeting_reply.py
 !/tests/test_user_calendars.py
 !/tests/test_clinic_phone.py
 !/tests/test_turn_credentials.py

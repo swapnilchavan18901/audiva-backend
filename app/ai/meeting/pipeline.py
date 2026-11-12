@@ -11,7 +11,6 @@ from dataclasses import dataclass, field
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams, VADState
 
-from app.ai.meeting.prompts import scope_refusal
 from app.constants import constants
 from app.utils.filler import with_filler
 
@@ -161,9 +160,20 @@ class MeetingVoice:
                     question = text
                 elif match:
                     self.armed.pop(participant, None)
-                entry = await self.save_turn(
-                    participant, text, "user", question is not None
-                )
+                memory = ""
+                save = self.save_turn(participant, text, "user", question is not None)
+                if question and self.get_memory:
+                    # Separate DB sessions: persist the turn while loading existing memory.
+                    # Wait for both on errors so neither operation is left running.
+                    results = await asyncio.gather(
+                        save, self.get_memory(), return_exceptions=True
+                    )
+                    for result in results:
+                        if isinstance(result, BaseException):
+                            raise result
+                    entry, memory = results
+                else:
+                    entry = await save
                 self.history.append(entry)
                 self.history = self.history[-60:]
                 # A newer human turn invalidates delayed STT/AI replies.
@@ -174,7 +184,7 @@ class MeetingVoice:
                 ):
                     self.error = None
                     self.answer_task = asyncio.create_task(
-                        self.reply(question, generation)
+                        self.reply(question, generation, memory)
                     )
             except asyncio.CancelledError:
                 raise
@@ -187,17 +197,11 @@ class MeetingVoice:
                     speaker.benchmark_turn = None
                 self.queue.task_done()
 
-    async def reply(self, question, generation):
+    async def reply(self, question, generation, memory=""):
         async def prepare_answer():
-            memory = await self.get_memory() if self.get_memory else ""
-            if not await self.speech.is_in_scope(
+            response = await self.speech.answer(
                 question, self.meeting, self.history, memory
-            ):
-                response = scope_refusal(constants.MEETING_VOICE_LANGUAGE)
-            else:
-                response = await self.speech.answer(
-                    question, self.meeting, self.history, memory
-                )
+            )
             return response, await self.speech.synthesize(response)
 
         async def speak_filler():

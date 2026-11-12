@@ -422,9 +422,7 @@ class TemplateDefinition(BaseModel):
     service_type: Literal["conversation", "clinic"] | None = None
 
 
-class ScopeDecision(BaseModel):
-    in_scope: StrictBool
-
-
 class SpokenReply(BaseModel):
-    spoken_answer: str = Field(min_length=1)
+    model_config = ConfigDict(extra="forbid")
+    in_scope: StrictBool
+    spoken_answer: str
