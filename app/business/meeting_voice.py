@@ -21,6 +21,7 @@ from app.constants import constants
 from app.constants.constants import STATES, TERMINAL
 from app.db.models import Meeting, MeetingCapture, utcnow
 from app.db.session import SessionFactory
+from app.integrations.google_meet_calendar import lock
 
 
 class AudioGrantLogFilter(logging.Filter):
@@ -161,6 +162,8 @@ class MeetingVoiceService:
             )
         if self.closing:
             raise HTTPException(503, "The meeting voice service is shutting down.")
+        # Serialize capture creation across copies of the same Google event.
+        await lock(db)
         await db.execute(
             select(Meeting.id).where(Meeting.id == meeting.id).with_for_update()
         )
@@ -201,6 +204,20 @@ class MeetingVoiceService:
             return self.output(active, meeting)
         if scheduled and (not meeting.auto_join or meeting.status != "scheduled"):
             return self.output(active, meeting)
+        duplicate = await db.scalar(
+            select(MeetingCapture.id)
+            .where(
+                MeetingCapture.meeting_id != meeting.id,
+                MeetingCapture.meet_url == meeting.next_meet_url,
+                MeetingCapture.scheduled_starts_at == meeting.next_starts_at,
+            )
+            .limit(1)
+        )
+        if duplicate:
+            raise HTTPException(
+                409,
+                "The assistant has already been requested for this meeting from another calendar.",
+            )
         capture = MeetingCapture(
             meeting_id=meeting.id,
             organization_id=meeting.organization_id,

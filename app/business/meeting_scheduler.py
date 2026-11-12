@@ -31,9 +31,24 @@ async def repeat(action, seconds):
 def start(service):
     async def calendar():
         async with SessionFactory() as db, create_google_client() as client:
-            connection = await db.scalar(select(MeetingGoogleConnection))
-            if connection and connection.status == "connected":
-                await sync(db, client, service.settings)
+            ids = list(
+                await db.scalars(
+                    select(MeetingGoogleConnection.id).where(
+                        MeetingGoogleConnection.status == "connected"
+                    )
+                )
+            )
+            for connection_id in ids:
+                try:
+                    await sync(
+                        db, client, service.settings, connection_id=connection_id
+                    )
+                except Exception:  # noqa: BLE001 - one calendar must not block other users
+                    await db.rollback()
+                    logger.warning(
+                        "Calendar sync failed for connection %s; retrying",
+                        connection_id,
+                    )
 
     async def dispatch():
         if not service.ready:
@@ -54,6 +69,13 @@ def start(service):
                             MeetingCapture.meeting_id == Meeting.id,
                             MeetingCapture.provider_occurrence_id
                             == Meeting.next_occurrence_id,
+                        )
+                        .exists(),
+                        ~select(MeetingCapture.id)
+                        .where(
+                            MeetingCapture.meet_url == Meeting.next_meet_url,
+                            MeetingCapture.scheduled_starts_at
+                            == Meeting.next_starts_at,
                         )
                         .exists(),
                     )
@@ -115,11 +137,7 @@ def start(service):
 
     jobs = [(service.memory.cleanup, constants.MEETING_RETENTION_CLEANUP_SECONDS)]
     settings = service.settings
-    if (
-        settings.google_client_id
-        and settings.meeting_bot_email
-        and settings.meeting_token_key.get_secret_value()
-    ):
+    if settings.google_client_id and settings.meeting_token_key.get_secret_value():
         jobs.append((calendar, constants.MEETING_CALENDAR_SYNC_SECONDS))
     if service.ready:
         jobs.extend(((dispatch, 10), (statuses, 15)))

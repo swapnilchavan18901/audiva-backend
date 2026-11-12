@@ -1,4 +1,4 @@
-"""Operator-only, read-only Calendar integration. No Meet browser authentication."""
+"""Read-only, isolated Google Calendar connections. No Meet browser authentication."""
 
 import base64
 import hashlib
@@ -44,8 +44,8 @@ def cipher(settings):
 
 
 def validate_configuration(settings):
-    if not settings.google_client_id or not settings.meeting_bot_email:
-        raise CalendarError("Configure GOOGLE_CLIENT_ID and MEETING_BOT_EMAIL first.")
+    if not settings.google_client_id:
+        raise CalendarError("Configure GOOGLE_CLIENT_ID first.")
     cipher(settings)
 
 
@@ -71,7 +71,7 @@ def parse_instant(value):
     return parsed.astimezone(UTC)
 
 
-def oauth_request(settings, redirect_uri):
+def oauth_request(settings, redirect_uri, *, personal=False):
     validate_configuration(settings)
     state, verifier = secrets.token_urlsafe(32), secrets.token_urlsafe(64)
     challenge = base64.urlsafe_b64encode(
@@ -88,7 +88,11 @@ def oauth_request(settings, redirect_uri):
             "state": state,
             "code_challenge": challenge.decode(),
             "code_challenge_method": "S256",
-            "login_hint": settings.meeting_bot_email,
+            **(
+                {"prompt": "consent select_account"}
+                if personal
+                else {"login_hint": settings.meeting_bot_email}
+            ),
         }
     )
     return url, state, verifier
@@ -132,10 +136,16 @@ def token_fields(data):
         raise CalendarError("Google did not return a usable access token.") from None
 
 
-async def connect(db, client, settings, code, verifier, redirect_uri):
+async def connect(db, client, settings, code, verifier, redirect_uri, *, user_id=None):
     validate_configuration(settings)
     await lock(db)
-    existing = await db.scalar(select(MeetingGoogleConnection))
+    existing = await db.scalar(
+        select(MeetingGoogleConnection).where(
+            MeetingGoogleConnection.user_id == user_id
+            if user_id
+            else MeetingGoogleConnection.singleton_key == 1
+        )
+    )
     response = await request(
         client,
         "POST",
@@ -164,26 +174,41 @@ async def connect(db, client, settings, code, verifier, redirect_uri):
     )
     if (
         identity.get("email_verified") is not True
-        or identity.get("email", "").casefold() != settings.meeting_bot_email.casefold()
+        or not identity.get("email")
+        or (
+            not user_id
+            and identity["email"].casefold() != settings.meeting_bot_email.casefold()
+        )
         or not identity.get("sub")
     ):
         raise CalendarError(
-            "Sign in with the configured, verified MEETING_BOT_EMAIL account."
+            "Sign in with a verified Google account"
+            if user_id
+            else "Sign in with the configured, verified MEETING_BOT_EMAIL account."
         )
-    if existing and existing.google_subject != identity["sub"]:
+    if (
+        existing
+        and existing.google_subject != identity["sub"]
+        and existing.status != "disabled"
+    ):
         raise CalendarError(
-            "A different bot account is already connected; account replacement is disabled."
+            "A different Google account is connected. Disconnect it before switching accounts."
         )
     refresh = tokens.get("refresh_token")
-    if not refresh and not existing:
+    if not refresh and (not existing or not existing.refresh_token_ciphertext):
         raise CalendarError(
             "No refresh token returned. Revoke this app grant and reconnect with consent."
         )
     if existing is None:
         existing = MeetingGoogleConnection(
-            google_subject=identity["sub"], email=identity["email"]
+            google_subject=identity["sub"],
+            email=identity["email"],
+            user_id=user_id,
+            singleton_key=None if user_id else 1,
         )
         db.add(existing)
+    existing.google_subject = identity["sub"]
+    existing.email = identity["email"].strip().lower()
     f = cipher(settings)
     if refresh:
         existing.refresh_token_ciphertext = f.encrypt(refresh.encode()).decode()
@@ -202,17 +227,27 @@ async def connect(db, client, settings, code, verifier, redirect_uri):
     if calendar is None:
         db.add(MeetingCalendar(connection_id=existing.id, google_calendar_id="primary"))
     await db.commit()
+    return existing
 
 
-async def access_token(db, client, settings, *, force=False):
+async def access_token(db, client, settings, *, force=False, connection_id=None):
     validate_configuration(settings)
     await lock(db)
     connection = await db.scalar(
-        select(MeetingGoogleConnection).execution_options(populate_existing=True)
+        select(MeetingGoogleConnection)
+        .where(
+            MeetingGoogleConnection.id == connection_id
+            if connection_id
+            else MeetingGoogleConnection.singleton_key == 1
+        )
+        .execution_options(populate_existing=True)
     )
     if connection is None or connection.status != "connected":
-        raise ReauthorizationRequired("Run the operator connect command first.")
-    if connection.email.casefold() != settings.meeting_bot_email.casefold():
+        raise ReauthorizationRequired("Connect your Google Calendar first.")
+    if (
+        connection.user_id is None
+        and connection.email.casefold() != settings.meeting_bot_email.casefold()
+    ):
         raise CalendarError(
             "Configured email does not match the connected bot account."
         )
@@ -246,7 +281,7 @@ async def access_token(db, client, settings, *, force=False):
             connection.updated_at = utcnow()
             await db.commit()
             raise ReauthorizationRequired(
-                "Google consent expired or was revoked; reconnect the bot."
+                "Google consent expired or was revoked; reconnect your calendar."
             )
     tokens = body(response)
     token, expires = token_fields(tokens)
@@ -428,7 +463,10 @@ async def apply_definition(db, client, calendar, token, data, now):
         )
         meeting.next_meet_url, meeting.next_title = selected["url"], selected["title"]
     meeting.status = "scheduled" if meeting.is_recurring or candidates else "completed"
-    await auto_assign_event(db, meeting)
+    # Personal calendars remain private until explicitly assigned by their owner.
+    connection = await db.get(MeetingGoogleConnection, calendar.connection_id)
+    if connection.user_id is None:
+        await auto_assign_event(db, meeting)
     return meeting
 
 
@@ -478,8 +516,16 @@ async def sync_calendar(db, client, calendar, token, settings, now):
     return len(masters)
 
 
-async def sync(db, client, settings):
-    token = await access_token(db, client, settings)
+async def sync(db, client, settings, *, connection_id=None):
+    if connection_id is None:
+        connection_id = await db.scalar(
+            select(MeetingGoogleConnection.id).where(
+                MeetingGoogleConnection.singleton_key == 1
+            )
+        )
+        if connection_id is None:
+            raise ReauthorizationRequired("Connect a calendar first.")
+    token = await access_token(db, client, settings, connection_id=connection_id)
     for attempt in range(2):
         try:
             await lock(db)
@@ -487,6 +533,7 @@ async def sync(db, client, settings):
                 await db.scalars(
                     select(MeetingCalendar).where(
                         MeetingCalendar.enabled.is_(True),
+                        MeetingCalendar.connection_id == connection_id,
                     )
                 )
             ).all()
@@ -501,9 +548,11 @@ async def sync(db, client, settings):
             await db.rollback()
             if attempt:
                 raise CalendarError(
-                    "Google rejected refreshed credentials; reconnect the bot."
+                    "Google rejected refreshed credentials; reconnect your calendar."
                 ) from None
-            token = await access_token(db, client, settings, force=True)
+            token = await access_token(
+                db, client, settings, force=True, connection_id=connection_id
+            )
         except Exception:
             await db.rollback()
             raise

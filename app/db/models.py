@@ -184,7 +184,7 @@ class ClinicAppointment(IdentityMixin, Base):
 
 
 class MeetingGoogleConnection(IdentityMixin, Base):
-    """One operator-managed identity for the whole deployment, never tenant credentials."""
+    """An encrypted calendar connection owned by a user, or the legacy operator."""
 
     __tablename__ = "meeting_google_connection"
     __table_args__ = (
@@ -194,8 +194,10 @@ class MeetingGoogleConnection(IdentityMixin, Base):
             name="ck_meeting_google_status",
         ),
     )
-    singleton_key: Mapped[int] = mapped_column(
-        unique=True, default=1, server_default="1"
+    # Only the legacy operator connection uses 1; user connections use NULL.
+    singleton_key: Mapped[int | None] = mapped_column(unique=True)
+    user_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), unique=True
     )
     google_subject: Mapped[str] = mapped_column(String(255), unique=True)
     email: Mapped[str] = mapped_column(String(320))
@@ -210,6 +212,17 @@ class MeetingGoogleConnection(IdentityMixin, Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )
+
+
+class CalendarOAuthState(Base):
+    __tablename__ = "calendar_oauth_states"
+    state_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), unique=True
+    )
+    verifier_ciphertext: Mapped[str] = mapped_column(Text)
+    redirect_uri: Mapped[str] = mapped_column(String(500))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 class MeetingCalendar(IdentityMixin, Base):

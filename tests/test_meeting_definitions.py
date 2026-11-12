@@ -150,6 +150,7 @@ async def env(tmp_path, monkeypatch):
             ]
         )
         connection = MeetingGoogleConnection(
+            singleton_key=1,
             google_subject="subject",
             email="bot@example.com",
             refresh_token_ciphertext="encrypted",

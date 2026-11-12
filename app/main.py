@@ -10,6 +10,7 @@ from app.ai.sessions import VoiceSessions
 from app.api import (
     auth,
     bots,
+    calendar,
     clinic,
     clinic_phone,
     health,
@@ -95,6 +96,7 @@ for router in (
     clinic.router,
     platform.router,
     meetings.router,
+    calendar.router,
     outreach.router,
     outreach.provider_router,
     clinic_phone.router,

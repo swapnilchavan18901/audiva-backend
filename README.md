@@ -515,3 +515,45 @@ The shared phone lifecycle policy lives in `app/business/call_status.py`; clinic
 and outreach callbacks must use it so late provider callbacks cannot regress a
 call or reopen a terminal outcome. Provider requests in the regression suite are
 mocked; PostgreSQL-specific tests require their configured test database.
+
+### Personal Google Calendar connections
+
+Calendar inbox now has its own **Connect Google Calendar** button. Each signed-in
+Audiva user can connect one Google account, including an email different from their
+Audiva login. The primary calendar's upcoming timed Google Meet events, including
+invitations, appear privately. Assigning an event explicitly shares it with a
+workspace; assigned events remain in the inbox with an Assigned badge. Personal
+calendar events are never automatically shared with a workspace.
+
+Deployment setup:
+
+1. Run `uv run alembic upgrade head` (migration `0015`).
+2. Enable Google Calendar API and configure a Google OAuth client of type **Web application**.
+3. Set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `MEETING_TOKEN_KEY` in the backend.
+   The existing `python -m app.core.meeting_google keygen` command generates an encryption key.
+4. Register the exact dashboard URL as an authorized redirect URI, for example
+   `http://localhost:3000/calendar-inbox`, `http://127.0.0.1:3000/calendar-inbox`,
+   and the production `https://YOUR-DASHBOARD/calendar-inbox`. Only register the
+   addresses you use, and include their origins in `CORS_ORIGINS`.
+5. Configure the OAuth consent screen for `openid`, `email`, and
+   `https://www.googleapis.com/auth/calendar.events.readonly`. Add test users while
+   the Google application is in testing; complete Google's publishing/verification
+   requirements for the intended audience before a public launch.
+
+Users authorize Google directly from Calendar inbox. OAuth uses PKCE and a
+single-use ten-minute state bound to their Audiva account and browser tab. Refresh
+and access tokens are encrypted in the database and never returned to the browser.
+The inbox offers Sync calendar, Reconnect, and Disconnect. Background sync processes
+each connected account independently every fifteen minutes. A failed connection
+does not prevent other users' calendars from syncing.
+
+Disconnect removes locally stored credentials and calendar links, stops future
+automatic joins from that connection, and preserves assigned workspace meeting
+history. It does not stop an assistant already in a meeting or revoke Google's
+app consent; users can also remove that consent from their Google account.
+Reconnecting starts a fresh calendar import. The assistant deduplicates join
+requests by meeting URL and scheduled start across connected calendars.
+
+The operator-managed bot calendar and trusted `link-organizer` CLI remain available
+for legacy deployments, but are not required for personal calendar connections.
+Personal calendar connections do not require `MEETING_BOT_EMAIL`.

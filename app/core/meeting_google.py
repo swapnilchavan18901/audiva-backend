@@ -97,7 +97,11 @@ async def run(command, no_browser=False):
             elif command == "sync":
                 print(json.dumps(await sync(db, client, settings)))
             else:
-                connection = await db.scalar(select(MeetingGoogleConnection))
+                connection = await db.scalar(
+                    select(MeetingGoogleConnection).where(
+                        MeetingGoogleConnection.singleton_key == 1
+                    )
+                )
                 print(
                     json.dumps(
                         {"status": connection.status, "email": connection.email}
