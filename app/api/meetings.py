@@ -1,9 +1,8 @@
 """Calendar assignment, Attendee voice control, and workspace meeting memory."""
 
-from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket
+from fastapi import APIRouter, HTTPException, Query, Request, WebSocket
 from sqlalchemy import and_, or_, select
 
 from app.api.dependencies import DB, CurrentUser
@@ -33,17 +32,6 @@ router = APIRouter(tags=["meetings"])
 
 def is_operator(user):
     return user.id in get_settings().meeting_operator_user_ids
-
-
-async def require_operator(user: CurrentUser):
-    if not is_operator(user):
-        raise HTTPException(
-            403, "Calendar inbox is restricted to the platform operator"
-        )
-    return user
-
-
-Operator = Annotated[object, Depends(require_operator)]
 
 
 @router.get("/meeting-capabilities")
@@ -219,6 +207,27 @@ async def owned_meeting(db, org_id, meeting_id, user_id):
     return meeting
 
 
+async def can_control_meeting(db, meeting, user):
+    member = await require_membership(db, meeting.organization_id, user.id)
+    if is_operator(user) or member.role in {"owner", "admin"}:
+        return True
+    return bool(
+        await db.scalar(
+            select(Meeting.id).where(Meeting.id == meeting.id, calendar_ownership(user))
+        )
+    )
+
+
+async def controlled_meeting(db, org_id, meeting_id, user):
+    meeting = await owned_meeting(db, org_id, meeting_id, user.id)
+    if not await can_control_meeting(db, meeting, user):
+        raise HTTPException(
+            403,
+            "Only the calendar owner or a workspace admin can control this assistant.",
+        )
+    return meeting
+
+
 @router.get("/organizations/{org_id}/meetings/{meeting_id}/connection")
 async def join_status(
     org_id: UUID, meeting_id: UUID, db: DB, user: CurrentUser, request: Request
@@ -226,25 +235,35 @@ async def join_status(
     meeting = await owned_meeting(db, org_id, meeting_id, user.id)
     service = request.app.state.meeting_voice
     capture = await service.capture(db, meeting.id)
-    return {**service.output(capture, meeting), "auto_join": meeting.auto_join}
+    return {
+        **service.output(capture, meeting),
+        "auto_join": meeting.auto_join,
+        "can_control": await can_control_meeting(db, meeting, user),
+    }
 
 
 @router.post("/organizations/{org_id}/meetings/{meeting_id}/join", status_code=202)
 async def join_now(
-    org_id: UUID, meeting_id: UUID, db: DB, operator: Operator, request: Request
+    org_id: UUID, meeting_id: UUID, db: DB, user: CurrentUser, request: Request
 ):
-    meeting = await owned_meeting(db, org_id, meeting_id, operator.id)
+    meeting = await controlled_meeting(db, org_id, meeting_id, user)
     if meeting.status == "cancelled":
         raise HTTPException(409, "Cancelled meetings cannot be joined")
-    return await request.app.state.meeting_voice.start(db, meeting)
+    return {
+        **(await request.app.state.meeting_voice.start(db, meeting)),
+        "can_control": True,
+    }
 
 
 @router.post("/organizations/{org_id}/meetings/{meeting_id}/leave")
 async def leave_now(
-    org_id: UUID, meeting_id: UUID, db: DB, operator: Operator, request: Request
+    org_id: UUID, meeting_id: UUID, db: DB, user: CurrentUser, request: Request
 ):
-    meeting = await owned_meeting(db, org_id, meeting_id, operator.id)
-    return await request.app.state.meeting_voice.stop(db, meeting)
+    meeting = await controlled_meeting(db, org_id, meeting_id, user)
+    return {
+        **(await request.app.state.meeting_voice.stop(db, meeting)),
+        "can_control": True,
+    }
 
 
 @router.websocket("/meeting-audio/{capture_id}")
@@ -266,9 +285,9 @@ async def schedule_meeting(
     meeting_id: UUID,
     data: MeetingSchedule,
     db: DB,
-    operator: Operator,
+    user: CurrentUser,
 ):
-    meeting = await owned_meeting(db, org_id, meeting_id, operator.id)
+    meeting = await controlled_meeting(db, org_id, meeting_id, user)
     await db.refresh(meeting, with_for_update=True)
     if meeting.status != "scheduled" or (
         not meeting.is_recurring

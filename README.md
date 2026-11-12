@@ -215,11 +215,11 @@ Sarvam supplies STT, LLM, and TTS services. Pipecat orchestrates browser voice s
 └──────────────────────────────────────────────────────────────┘
 ```
 
-- Assignment follows the event's organizer email, matched to an operator-verified calendar identity. A self-declared signup email is insufficient.
-- The Google connection is shared and operator-managed; this is not a separate Google OAuth connection for every dashboard user.
+- Personal inbox ownership follows the user's verified Google OAuth connection, including invited meetings. Legacy shared calendars still use operator-verified organizer identities.
+- Each dashboard user can connect their own Google account from Calendar inbox. The operator-managed shared connection remains available for legacy deployments.
 - A user with multiple organizations receives only their own membership choices. Their pending inbox and those choices are private to them, including from other workspace owners.
 - Once assigned, the meeting belongs to the selected workspace and becomes visible through that workspace's meeting access rules.
-- One `meetings` row represents a standalone event or an entire recurring series. Unassigned definitions appear only in the organizer's private inbox; assigning a recurring definition assigns the series.
+- One `meetings` row represents a standalone event or an entire recurring series. Personal definitions appear in their calendar owner's private inbox, including after assignment; assigning a recurring definition assigns the series.
 - Google resolves recurrence and exceptions inside a rolling 30-day window. Only the next unattempted occurrence is persisted on the definition; future occurrences do not become database rows.
 - Actual join attempts create `meeting_captures` rows with immutable occurrence timing, title, link, and agenda. Calendar advancement is independent of capture completion and memory generation.
 - A unique meeting/occurrence pair prevents duplicate join attempts. Cancelled, expired, untimed, or non-Meet occurrences are not eligible for assignment or joining.
@@ -557,3 +557,18 @@ requests by meeting URL and scheduled start across connected calendars.
 The operator-managed bot calendar and trusted `link-organizer` CLI remain available
 for legacy deployments, but are not required for personal calendar connections.
 Personal calendar connections do not require `MEETING_BOT_EMAIL`.
+
+
+### Manual meeting controls
+
+Calendar owners, workspace owners/admins, and platform operators with workspace
+membership can send/remove the assistant and change auto-join for an assigned
+meeting. Other workspace members can view its status and open Google Meet, but
+cannot control the bot. The connection endpoint returns `can_control` for the UI;
+every mutation independently enforces the same permissions.
+
+Calendar inbox has **Open Meet** to join as yourself and **Manage assistant** on
+assigned meetings to open the relevant workspace. The Meetings page shows
+**Join with Audiva** and explains unavailable states. Manual bot joining is
+available from ten minutes before the scheduled start until the session ends,
+when the meeting voice services are configured.

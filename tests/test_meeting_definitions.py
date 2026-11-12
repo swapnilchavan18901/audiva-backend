@@ -177,7 +177,6 @@ async def env(tmp_path, monkeypatch):
     app.include_router(api.router)
     app.state.meeting_voice = service
     app.dependency_overrides[current_user] = lambda: user
-    app.dependency_overrides[api.require_operator] = lambda: user
 
     async def database():
         async with sessions() as db:

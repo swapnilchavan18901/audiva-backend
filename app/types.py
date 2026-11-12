@@ -283,6 +283,7 @@ class MeetingCaptureOut(ORMModel):
 
 
 class EventOut(BaseModel):
+    organization_id: UUID | None
     model_config = ConfigDict(from_attributes=True)
     id: UUID
     recurring_event_id: str | None

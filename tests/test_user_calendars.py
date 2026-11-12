@@ -257,3 +257,76 @@ async def test_same_meeting_in_two_calendars_cannot_launch_two_bots(env):
         await join(env, copy_id)
     assert error.value.status_code == 409
     assert len(env.provider.created) == 1
+
+
+@pytest.mark.asyncio
+async def test_calendar_owner_member_can_control_bot_without_operator_permission(
+    env, monkeypatch
+):
+    from sqlalchemy import select
+
+    from app.api import meetings
+    from app.db.models import Membership
+
+    monkeypatch.setattr(meetings, "is_operator", lambda user: False)
+    async with env.sessions() as db:
+        connection = await db.get(MeetingGoogleConnection, env.calendar.connection_id)
+        connection.user_id = env.user.id
+        connection.singleton_key = None
+        member = await db.scalar(
+            select(Membership).where(
+                Membership.user_id == env.user.id,
+                Membership.organization_id == env.org.id,
+            )
+        )
+        member.role = "member"
+        await db.commit()
+    meeting = await sync(env)
+    await env.dashboard.post(
+        f"/calendar/events/{meeting.id}/assign",
+        json={"organization_id": str(env.org.id), "auto_join": False},
+    )
+    path = f"/organizations/{env.org.id}/meetings/{meeting.id}"
+    status = await env.dashboard.get(path + "/connection")
+    assert status.json()["can_control"] is True
+    response = await env.dashboard.post(path + "/join")
+    assert response.status_code == 202, response.text
+    assert response.json()["can_control"] is True
+    assert len(env.provider.created) == 1
+    response = await env.dashboard.post(path + "/leave")
+    assert response.status_code == 200
+    assert (
+        await env.dashboard.put(path + "/schedule", json={"auto_join": True})
+    ).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_other_members_cannot_control_but_workspace_admin_can(env, monkeypatch):
+    from app.api import meetings
+    from app.db.models import Membership
+
+    monkeypatch.setattr(meetings, "is_operator", lambda user: False)
+    meeting = await sync(env)
+    path = f"/organizations/{env.org.id}/meetings/{meeting.id}"
+    env.app.dependency_overrides[current_user] = lambda: env.other
+    assert (await env.dashboard.post(path + "/join")).status_code == 404
+    async with env.sessions() as db:
+        member = Membership(
+            user_id=env.other.id, organization_id=env.org.id, role="member"
+        )
+        db.add(member)
+        await db.commit()
+    assert (await env.dashboard.get(path + "/connection")).json()[
+        "can_control"
+    ] is False
+    for action in ["join", "leave"]:
+        assert (await env.dashboard.post(path + "/" + action)).status_code == 403
+    assert (
+        await env.dashboard.put(path + "/schedule", json={"auto_join": False})
+    ).status_code == 403
+    async with env.sessions() as db:
+        member = await db.get(Membership, member.id)
+        member.role = "admin"
+        await db.commit()
+    assert (await env.dashboard.get(path + "/connection")).json()["can_control"] is True
+    assert (await env.dashboard.post(path + "/join")).status_code == 202
