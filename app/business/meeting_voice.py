@@ -83,10 +83,11 @@ class MeetingVoiceService:
 
     def output(self, capture, meeting):
         runtime = self.live.get(capture.id) if capture else None
-        due = (
+        joinable = (
             meeting.next_starts_at
             and meeting.next_ends_at
-            and aware(meeting.next_starts_at) <= utcnow() + timedelta(minutes=10)
+            and meeting.next_occurrence_id
+            and meeting.next_meet_url
             and aware(meeting.next_ends_at) > utcnow()
         )
         active = capture and capture.status in {
@@ -113,7 +114,7 @@ class MeetingVoiceService:
             "memory_status": capture.memory_status if capture else "pending",
             "memory_error": capture.memory_error if capture else None,
             "can_join": bool(
-                due
+                joinable
                 and not active
                 and not runtime
                 and meeting.status != "cancelled"
@@ -180,8 +181,7 @@ class MeetingVoiceService:
             or not meeting.next_starts_at
             or not meeting.next_ends_at
             or aware(meeting.next_ends_at) <= utcnow()
-            or aware(meeting.next_starts_at)
-            > utcnow() + timedelta(minutes=0 if scheduled else 10)
+            or (scheduled and aware(meeting.next_starts_at) > utcnow())
         ):
             raise HTTPException(409, "No occurrence is currently available to join")
         capture = await db.scalar(

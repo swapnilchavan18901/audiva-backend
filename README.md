@@ -570,5 +570,7 @@ every mutation independently enforces the same permissions.
 Calendar inbox has **Open Meet** to join as yourself and **Manage assistant** on
 assigned meetings to open the relevant workspace. The Meetings page shows
 **Join with Audiva** and explains unavailable states. Manual bot joining is
-available from ten minutes before the scheduled start until the session ends,
-when the meeting voice services are configured.
+available on demand for any upcoming or ongoing session with a valid Google Meet
+link, when the meeting voice services are configured. Manual requests can join
+before the scheduled start; automatic joins still wait for the scheduled time.
+The host may need to admit the assistant.

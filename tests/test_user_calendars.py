@@ -330,3 +330,22 @@ async def test_other_members_cannot_control_but_workspace_admin_can(env, monkeyp
         await db.commit()
     assert (await env.dashboard.get(path + "/connection")).json()["can_control"] is True
     assert (await env.dashboard.post(path + "/join")).status_code == 202
+
+
+@pytest.mark.asyncio
+async def test_manual_join_can_start_tomorrows_meeting_but_auto_join_waits(env):
+    env.google.items = [env.google.instance("tomorrow", 1)]
+    meeting = await sync(env)
+    path = f"/organizations/{env.org.id}/meetings/{meeting.id}"
+    response = await env.dashboard.get(path + "/connection")
+    assert response.json()["can_join"] is True
+    assert response.json()["can_control"] is True
+    # The scheduler must still respect the scheduled start time.
+    with pytest.raises(HTTPException) as error:
+        await join(env, meeting.id)
+    assert error.value.status_code == 409
+    assert not env.provider.created
+    response = await env.dashboard.post(path + "/join")
+    assert response.status_code == 202, response.text
+    assert len(env.provider.created) == 1
+    assert env.provider.created[0]["meeting_url"] == meeting.next_meet_url
