@@ -267,7 +267,9 @@ class MeetingVoiceService:
                 },
             )
             capture.provider_bot_id = bot["id"]
-            self.apply_state(capture, meeting, bot.get("state", "joining"))
+            self.apply_state(
+                capture, meeting, bot.get("state", "joining"), events=bot.get("events")
+            )
         except HTTPException as error:
             capture.status = (
                 "unknown" if "did not respond" in error.detail else "failed"
@@ -286,11 +288,29 @@ class MeetingVoiceService:
         await db.commit()
         return self.output(capture, meeting)
 
-    def apply_state(self, capture, meeting, provider_state):
+    def apply_state(self, capture, meeting, provider_state, *, events=None):
         capture.provider_status = provider_state
         capture.status, capture.detail = STATES.get(
             provider_state, ("joining", "Checking assistant status.")
         )
+        if provider_state == "fatal_error" and isinstance(events, list):
+            # Surface only known, safe reasons, never raw provider payloads or URLs.
+            failure = next(
+                (
+                    event
+                    for event in reversed(events)
+                    if isinstance(event, dict)
+                    and event.get("type") == "could_not_join_meeting"
+                ),
+                {},
+            )
+            if failure.get("sub_type") == "login_required":
+                capture.detail = (
+                    "Google Meet requires the assistant to sign in. "
+                    "Configure a signed-in Google Meet bot in Attendee, "
+                    "or use a meeting that permits guest participants. "
+                    "Connecting your calendar does not sign the bot into Google Meet."
+                )
         capture.detail = capture.detail.replace("Audiva", constants.MEETING_VOICE_NAME)
         capture.updated_at = capture.last_synced_at = utcnow()
         # Session state belongs to the capture. A late status response for yesterday
@@ -319,7 +339,12 @@ class MeetingVoiceService:
                 bot = await self.attendee.request(
                     "GET", f"bots/{capture.provider_bot_id}"
                 )
-                self.apply_state(capture, meeting, bot.get("state", "joining"))
+                self.apply_state(
+                    capture,
+                    meeting,
+                    bot.get("state", "joining"),
+                    events=bot.get("events"),
+                )
                 try:
                     events = await self.attendee.request(
                         "GET", f"bots/{capture.provider_bot_id}/participant_events"

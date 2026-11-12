@@ -574,3 +574,14 @@ available on demand for any upcoming or ongoing session with a valid Google Meet
 link, when the meeting voice services are configured. Manual requests can join
 before the scheduled start; automatic joins still wait for the scheduled time.
 The host may need to admit the assistant.
+
+Google Calendar OAuth authorizes event reading only; it does not authenticate the
+meeting participant bot. The current bot creation request uses an anonymous Google
+Meet participant. If Attendee reports `could_not_join_meeting` with
+`sub_type=login_required`, the UI explains that Google required bot authentication.
+A normal timed Google Calendar event with a Google Meet link is sufficient for
+calendar import, but the meeting must permit the bot to join. For meetings requiring
+signed-in participants, configure Attendee's Google Workspace/SAML bot login and
+then enable `google_meet_settings.use_login` in the bot creation integration; simply
+connecting a personal Gmail calendar does not provide that bot login.
+See https://docs.attendee.dev/guides/signedinbots.

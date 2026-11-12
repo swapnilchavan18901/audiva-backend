@@ -349,3 +349,39 @@ async def test_manual_join_can_start_tomorrows_meeting_but_auto_join_waits(env):
     assert response.status_code == 202, response.text
     assert len(env.provider.created) == 1
     assert env.provider.created[0]["meeting_url"] == meeting.next_meet_url
+
+
+@pytest.mark.asyncio
+async def test_google_login_failure_has_actionable_detail(env):
+    from app.db.models import MeetingCapture
+
+    meeting = await sync(env)
+    result = await join(env, meeting.id)
+    async with env.sessions() as db:
+        capture = await db.get(MeetingCapture, result["capture_id"])
+        definition = await db.get(Meeting, meeting.id)
+        env.service.apply_state(
+            capture,
+            definition,
+            "fatal_error",
+            events=[
+                {"type": "join_requested"},
+                {
+                    "type": "could_not_join_meeting",
+                    "sub_type": "login_required",
+                    "private_data": "do-not-display",
+                },
+            ],
+        )
+        assert "requires the assistant to sign in" in capture.detail
+        assert "Attendee" in capture.detail
+        assert "do-not-display" not in capture.detail
+        env.service.apply_state(
+            capture,
+            definition,
+            "fatal_error",
+            events=[
+                {"type": "could_not_join_meeting", "sub_type": "unknown-provider-error"}
+            ],
+        )
+        assert "unknown-provider-error" not in capture.detail
